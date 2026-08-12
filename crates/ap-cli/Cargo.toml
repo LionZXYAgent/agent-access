@@ -12,12 +12,20 @@ repository.workspace = true
 name = "aac"
 path = "src/main.rs"
 
+[features]
+default = ["bws"]
+# Bitwarden Secrets Manager provider. Pulls the full Secrets Manager SDK
+# (reqwest/rustls/rsa/argon2) into the binary; disable it if you only use the
+# `bitwarden` CLI or `example` providers.
+bws = ["dep:bitwarden"]
+
 [dependencies]
 ap-noise = { workspace = true }
 ap-relay-client = { workspace = true, features = ["native-websocket"] }
 ap-relay-protocol = { workspace = true }
 ap-client = { workspace = true, features = ["native-websocket"] }
 async-trait = { workspace = true }
+bitwarden = { workspace = true, optional = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 crossterm = { workspace = true }
@@ -28,10 +36,13 @@ rand = { workspace = true }
 ratatui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "io-std", "process"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 secrecy = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
 
 [lints]
 workspace = true

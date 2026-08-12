@@ -175,7 +175,7 @@ async fn list_cache(client_type: Option<ClientType>) -> Result<()> {
         if connections.is_empty() {
             println!("  {}: {}", grey("Connections"), grey("(none)"));
         } else {
-            connections.sort_by(|a, b| b.last_connected_at.cmp(&a.last_connected_at));
+            connections.sort_by_key(|c| std::cmp::Reverse(c.last_connected_at));
             println!(
                 "  {}: ({} peer{})",
                 grey("Connections"),

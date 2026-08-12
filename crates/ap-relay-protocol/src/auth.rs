@@ -85,13 +85,12 @@ impl IdentityKeyPair {
                 let mut seed = [0u8; 32];
                 let mut rng = rand::thread_rng();
                 rng.fill_bytes(&mut seed);
-                let keypair = MlDsa65::from_seed(&seed.into());
-                let private_key = keypair.signing_key();
-                let public_key = keypair.verifying_key();
+                let private_key = MlDsa65::from_seed(&seed.into());
+                let public_key = private_key.signing_key().verifying_key();
                 IdentityKeyPair::MlDsa65 {
                     private_key_encoded: seed,
-                    private_key: Box::new(private_key.clone()),
-                    public_key: Box::new(public_key.clone()),
+                    private_key: Box::new(private_key),
+                    public_key: Box::new(public_key),
                 }
             }
         }
@@ -214,14 +213,13 @@ impl IdentityKeyPair {
                         "Missing ML-DSA-65 private key seed in COSE key".to_string(),
                     )
                 })?;
-                let keypair = MlDsa65::from_seed(&seed.into());
-                let private_key = keypair.signing_key();
-                let public_key = keypair.verifying_key();
+                let private_key = MlDsa65::from_seed(&seed.into());
+                let public_key = private_key.signing_key().verifying_key();
 
                 Ok(IdentityKeyPair::MlDsa65 {
                     private_key_encoded: seed,
-                    private_key: Box::new(private_key.clone()),
-                    public_key: Box::new(public_key.clone()),
+                    private_key: Box::new(private_key),
+                    public_key: Box::new(public_key),
                 })
             }
             _ => Err(RelayError::InvalidMessage(
@@ -568,6 +566,7 @@ impl Challenge {
             #[cfg(feature = "experimental-post-quantum-crypto")]
             IdentityKeyPair::MlDsa65 { private_key, .. } => {
                 let signature = private_key
+                    .signing_key()
                     .sign_deterministic(&self.0, &[])
                     .expect("ML-DSA signing should succeed");
 
@@ -767,7 +766,7 @@ mod tests {
 
     #[test]
     fn test_fingerprint_from_hex_wrong_length() {
-        let err = IdentityFingerprint::from_hex("aabb").unwrap_err();
+        let err = IdentityFingerprint::from_hex("aabb").expect_err("short hex should not parse");
         assert!(err.to_string().contains("64 characters"));
     }
 

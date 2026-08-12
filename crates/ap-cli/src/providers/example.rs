@@ -5,6 +5,7 @@
 //! development.
 
 use ap_client::CredentialData;
+use async_trait::async_trait;
 
 use super::{CredentialProvider, CredentialQuery, LookupResult, ProviderStatus};
 
@@ -50,22 +51,23 @@ impl ExampleProvider {
     }
 }
 
+#[async_trait]
 impl CredentialProvider for ExampleProvider {
     fn name(&self) -> &str {
         "Example"
     }
 
-    fn status(&self) -> ProviderStatus {
+    async fn status(&self) -> ProviderStatus {
         ProviderStatus::Ready {
             user_info: Some("alice (example provider)".to_string()),
         }
     }
 
-    fn unlock(&mut self, _input: &str) -> Result<(), String> {
+    async fn unlock(&mut self, _input: &str) -> Result<(), String> {
         Ok(())
     }
 
-    fn lookup(&self, query: &CredentialQuery) -> LookupResult {
+    async fn lookup(&self, query: &CredentialQuery) -> LookupResult {
         let result = match query {
             CredentialQuery::Domain(domain) => {
                 let domain_lower = domain.to_lowercase();
@@ -106,10 +108,12 @@ impl CredentialProvider for ExampleProvider {
 mod tests {
     use super::*;
 
-    #[test]
-    fn lookup_example_com() {
+    #[tokio::test]
+    async fn lookup_example_com() {
         let provider = ExampleProvider::new();
-        let result = provider.lookup(&CredentialQuery::Domain("example.com".to_string()));
+        let result = provider
+            .lookup(&CredentialQuery::Domain("example.com".to_string()))
+            .await;
         match result {
             LookupResult::Found(cred) => {
                 assert_eq!(cred.username.as_deref(), Some("alice@example.com"));
@@ -119,10 +123,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lookup_google_com() {
+    #[tokio::test]
+    async fn lookup_google_com() {
         let provider = ExampleProvider::new();
-        let result = provider.lookup(&CredentialQuery::Domain("google.com".to_string()));
+        let result = provider
+            .lookup(&CredentialQuery::Domain("google.com".to_string()))
+            .await;
         match result {
             LookupResult::Found(cred) => {
                 assert_eq!(cred.username.as_deref(), Some("example@gmail.com"));
@@ -132,10 +138,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lookup_github_com() {
+    #[tokio::test]
+    async fn lookup_github_com() {
         let provider = ExampleProvider::new();
-        let result = provider.lookup(&CredentialQuery::Domain("github.com".to_string()));
+        let result = provider
+            .lookup(&CredentialQuery::Domain("github.com".to_string()))
+            .await;
         match result {
             LookupResult::Found(cred) => {
                 assert_eq!(cred.username.as_deref(), Some("example-dev"));
@@ -144,10 +152,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lookup_by_id() {
+    #[tokio::test]
+    async fn lookup_by_id() {
         let provider = ExampleProvider::new();
-        let result = provider.lookup(&CredentialQuery::Id("cred-github-001".to_string()));
+        let result = provider
+            .lookup(&CredentialQuery::Id("cred-github-001".to_string()))
+            .await;
         match result {
             LookupResult::Found(cred) => {
                 assert_eq!(cred.domain.as_deref(), Some("github.com"));
@@ -156,10 +166,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lookup_by_search() {
+    #[tokio::test]
+    async fn lookup_by_search() {
         let provider = ExampleProvider::new();
-        let result = provider.lookup(&CredentialQuery::Search("example-dev".to_string()));
+        let result = provider
+            .lookup(&CredentialQuery::Search("example-dev".to_string()))
+            .await;
         match result {
             LookupResult::Found(cred) => {
                 assert_eq!(cred.domain.as_deref(), Some("github.com"));
@@ -168,29 +180,36 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lookup_not_found() {
+    #[tokio::test]
+    async fn lookup_not_found() {
         let provider = ExampleProvider::new();
-        let result = provider.lookup(&CredentialQuery::Domain("unknown.com".to_string()));
+        let result = provider
+            .lookup(&CredentialQuery::Domain("unknown.com".to_string()))
+            .await;
         assert!(matches!(result, LookupResult::NotFound));
     }
 
-    #[test]
-    fn lookup_case_insensitive() {
+    #[tokio::test]
+    async fn lookup_case_insensitive() {
         let provider = ExampleProvider::new();
-        let result = provider.lookup(&CredentialQuery::Domain("GITHUB.COM".to_string()));
+        let result = provider
+            .lookup(&CredentialQuery::Domain("GITHUB.COM".to_string()))
+            .await;
         assert!(matches!(result, LookupResult::Found(_)));
     }
 
-    #[test]
-    fn status_always_ready() {
+    #[tokio::test]
+    async fn status_always_ready() {
         let provider = ExampleProvider::new();
-        assert!(matches!(provider.status(), ProviderStatus::Ready { .. }));
+        assert!(matches!(
+            provider.status().await,
+            ProviderStatus::Ready { .. }
+        ));
     }
 
-    #[test]
-    fn unlock_always_succeeds() {
+    #[tokio::test]
+    async fn unlock_always_succeeds() {
         let mut provider = ExampleProvider::new();
-        assert!(provider.unlock("anything").is_ok());
+        assert!(provider.unlock("anything").await.is_ok());
     }
 }

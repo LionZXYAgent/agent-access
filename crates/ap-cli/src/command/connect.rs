@@ -18,13 +18,19 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 use super::output::{
-    OutputFormat, emit_json_error, emit_json_success, emit_text_credential, exit_code_for_error,
+    OutputFormat, emit_json_error, emit_json_reference, emit_json_secret_reference,
+    emit_json_success, emit_text_credential, emit_text_reference, emit_text_secret_reference,
+    exit_code_for_report,
 };
 use super::tui::{
     App, AppAction, MessageKind, Mode, init_terminal, restore_terminal, wait_for_keypress,
 };
 use super::util::{format_connect_notification, format_relative_time};
 use crate::storage::{FileConnectionCache, FileIdentityStorage};
+use crate::transport::local::{
+    self, LocalEndpoint, LocalTransportError, SecretOutcome, SecretQueryInput, WireDelivery,
+    WireOutcome,
+};
 use ap_client::MemoryConnectionStore;
 
 use super::DEFAULT_RELAY_URL;
@@ -65,12 +71,30 @@ pub struct ConnectArgs {
     pub verify_fingerprint: bool,
 
     /// Domain to request credentials for (single-shot, non-interactive)
-    #[arg(long, conflicts_with = "id")]
+    #[arg(long, conflicts_with_all = ["id", "search", "secret"])]
     pub domain: Option<String>,
 
-    /// Vault item ID to request credentials for (single-shot, non-interactive)
-    #[arg(long, conflicts_with = "domain")]
+    /// Vault item ID to request credentials for (single-shot, non-interactive).
+    /// Accepts a bare id or a `bw://item/<id>` reference.
+    #[arg(long, conflicts_with_all = ["domain", "search", "secret"])]
     pub id: Option<String>,
+
+    /// Free-text search for credentials (single-shot, non-interactive)
+    #[arg(long, conflicts_with_all = ["domain", "id", "secret"])]
+    pub search: Option<String>,
+
+    /// Secrets Manager secret name or `bw://secret/<id>` reference
+    /// (single-shot, non-interactive). Local transport only — there is no
+    /// relay fallback for secrets. Always reference delivery: prints the
+    /// `bw://secret/<id>` reference and the secret's name, never the value.
+    #[arg(long, conflicts_with_all = ["domain", "id", "search"])]
+    pub secret: Option<String>,
+
+    /// Local agent-access endpoint to use instead of the platform default
+    /// (unix socket path / windows pipe name). Forces the local transport:
+    /// fails rather than falling back to the relay if unreachable.
+    #[arg(long, env = "AAC_SOCKET")]
+    pub socket: Option<String>,
 
     /// Timeout in seconds for credential response (default: 120)
     #[arg(long)]
@@ -84,9 +108,16 @@ pub struct ConnectArgs {
 impl ConnectArgs {
     /// Execute the connect command
     pub async fn run(self, log_rx: Option<super::tui_tracing::LogReceiver>) -> Result<()> {
-        let query = match (&self.domain, &self.id) {
-            (Some(domain), _) => Some(ap_client::CredentialQuery::Domain(domain.clone())),
-            (_, Some(id)) => Some(ap_client::CredentialQuery::Id(id.clone())),
+        if let Some(secret) = self.secret {
+            return run_single_shot_secret(secret, self.output, self.socket).await;
+        }
+
+        let query = match (&self.domain, &self.id, &self.search) {
+            (Some(domain), _, _) => Some(ap_client::CredentialQuery::Domain(domain.clone())),
+            (_, Some(id), _) => Some(ap_client::CredentialQuery::Id(
+                local::strip_reference(id).to_string(),
+            )),
+            (_, _, Some(search)) => Some(ap_client::CredentialQuery::Search(search.clone())),
             _ => None,
         };
 
@@ -99,6 +130,7 @@ impl ConnectArgs {
                 query,
                 self.output,
                 self.timeout,
+                self.socket,
             )
             .await
         } else {
@@ -319,7 +351,7 @@ async fn run_interactive_session(
         Phase::Connecting
     } else if !cached_connections.is_empty() && !ephemeral_connection {
         // Cached sessions available — show pick list
-        cached_connections.sort_by(|a, b| b.last_connected_at.cmp(&a.last_connected_at));
+        cached_connections.sort_by_key(|c| std::cmp::Reverse(c.last_connected_at));
         let sorted = cached_connections;
         let options = connection_pick_options(&sorted);
         app.set_mode(Mode::Pick {
@@ -774,6 +806,294 @@ pub(super) async fn fetch_credential(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Delivery mode for a dispatched credential request. Only meaningful for
+/// the local transport (the relay path is unchanged this phase and always
+/// returns a value-bearing credential).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Delivery {
+    /// `aac run` — values are injected into the child process's env, never printed.
+    Inject,
+    /// `aac get`-style single-shot — never returns credential values locally.
+    Reference,
+}
+
+impl From<Delivery> for WireDelivery {
+    fn from(delivery: Delivery) -> Self {
+        match delivery {
+            Delivery::Inject => WireDelivery::Inject,
+            Delivery::Reference => WireDelivery::Reference,
+        }
+    }
+}
+
+/// Outcome of a dispatched credential request.
+#[derive(Debug)]
+pub(super) enum CredentialOutcome {
+    /// Value-bearing credential: always for the relay path, and for the
+    /// local path when `delivery == Inject`.
+    Credential(ap_client::CredentialData),
+    /// Local-only, value-free response: an opaque item reference plus a
+    /// display name/username. Never produced by the relay path.
+    Reference {
+        reference: String,
+        item_name: Option<String>,
+        item_username: Option<String>,
+    },
+}
+
+/// Which transport a request should use, decided once per invocation.
+enum Transport {
+    /// Use the local endpoint. `forced` is `true` when the user explicitly
+    /// requested it via `--socket`/`AAC_SOCKET`: on failure there, we must
+    /// fail hard rather than silently falling back to the relay.
+    Local {
+        endpoint: LocalEndpoint,
+        forced: bool,
+    },
+    /// Use the relay (unchanged pre-existing path).
+    Relay,
+}
+
+/// Decide which transport to use for this request.
+///
+/// `--socket`/`AAC_SOCKET` (passed in as `socket_override`) forces the local
+/// transport. Otherwise, the local transport is attempted opportunistically
+/// against the platform default endpoint — connect failure there (no
+/// listener, socket file missing, ...) is treated as "local unavailable"
+/// and falls back to the relay. There is deliberately no separate
+/// availability probe: the first (and only) connection attempt for a
+/// request *is* the availability check, so a request is never dispatched
+/// twice.
+fn resolve_transport(socket_override: Option<&str>) -> Transport {
+    if let Some(path) = socket_override {
+        return Transport::Local {
+            endpoint: LocalEndpoint::from_override(path),
+            forced: true,
+        };
+    }
+    match LocalEndpoint::default_endpoint() {
+        Some(endpoint) => Transport::Local {
+            endpoint,
+            forced: false,
+        },
+        None => Transport::Relay,
+    }
+}
+
+/// Map a local `approved`+`inject` credential into the shared
+/// `CredentialData` shape used by the relay path. The local wire protocol
+/// never includes `notes` or `domain`; `domain` is backfilled from the
+/// query when it was a domain lookup so `--env domain` / `AAC_DOMAIN`
+/// behave the same as on the relay path.
+fn local_credential_to_data(
+    credential: local::WireCredential,
+    query: &ap_client::CredentialQuery,
+) -> ap_client::CredentialData {
+    ap_client::CredentialData {
+        username: credential.username,
+        password: credential.password,
+        totp: credential.totp,
+        uri: credential.uri,
+        notes: None,
+        credential_id: credential.credential_id,
+        domain: match query {
+            ap_client::CredentialQuery::Domain(d) => Some(d.clone()),
+            ap_client::CredentialQuery::Id(_) | ap_client::CredentialQuery::Search(_) => None,
+        },
+    }
+}
+
+/// Dispatch a credential request through the local transport when
+/// available/requested, falling back to the relay otherwise. Both `aac
+/// [connect] --domain/--id/--search` and `aac run` go through this
+/// function.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn fetch_credential_dispatch(
+    relay_url: &str,
+    token: Option<&str>,
+    session_fingerprint: Option<&str>,
+    ephemeral_connection: bool,
+    query: &ap_client::CredentialQuery,
+    credential_timeout: Option<std::time::Duration>,
+    socket_override: Option<&str>,
+    delivery: Delivery,
+) -> Result<CredentialOutcome> {
+    match resolve_transport(socket_override) {
+        Transport::Local { endpoint, forced } => {
+            match local::request_credential(&endpoint, query, delivery.into()).await {
+                // Defense in depth: a local server that ignores `delivery`
+                // and returns a value-bearing credential for a reference
+                // request must not have those values printed. Mirrors the
+                // guard in `command/mcp.rs`'s `run_find_logins` for the same
+                // corner (Credential outcome for a Reference-mode request).
+                Ok(WireOutcome::Credential(_)) if matches!(delivery, Delivery::Reference) => {
+                    Err(color_eyre::eyre::eyre!(
+                        "local agent-access endpoint returned a credential-bearing response for \
+                         a reference request; refusing to print it"
+                    ))
+                }
+                Ok(WireOutcome::Credential(credential)) => Ok(CredentialOutcome::Credential(
+                    local_credential_to_data(credential, query),
+                )),
+                Ok(WireOutcome::Reference { reference, item }) => {
+                    Ok(CredentialOutcome::Reference {
+                        reference,
+                        item_name: item.name,
+                        item_username: item.username,
+                    })
+                }
+                Err(LocalTransportError::ConnectFailed(reason)) if !forced => {
+                    info!(
+                        "Local agent-access endpoint unreachable ({reason}); falling back to relay"
+                    );
+                    let credential = fetch_credential(
+                        relay_url,
+                        token,
+                        session_fingerprint,
+                        ephemeral_connection,
+                        query,
+                        credential_timeout,
+                    )
+                    .await?;
+                    Ok(CredentialOutcome::Credential(credential))
+                }
+                Err(e) => Err(color_eyre::eyre::eyre!(e)),
+            }
+        }
+        Transport::Relay => {
+            let credential = fetch_credential(
+                relay_url,
+                token,
+                session_fingerprint,
+                ephemeral_connection,
+                query,
+                credential_timeout,
+            )
+            .await?;
+            Ok(CredentialOutcome::Credential(credential))
+        }
+    }
+}
+
+/// Outcome of a dispatched Secrets Manager secret request. Mirrors
+/// [`CredentialOutcome`], but secrets are local-transport-only (architecture
+/// doc, M4: "secrets never ride the relay") — there is no value-bearing
+/// variant sourced from the relay.
+#[derive(Debug)]
+pub(super) enum SecretRequestOutcome {
+    /// Value-bearing secret: only ever produced for `Delivery::Inject`.
+    Secret(local::WireSecret),
+    /// Value-free response: an opaque `bw://secret/<id>` reference plus the
+    /// secret's name.
+    Reference {
+        reference: String,
+        item_name: Option<String>,
+    },
+}
+
+/// Dispatch a Secrets Manager secret request through the local transport.
+///
+/// Unlike [`fetch_credential_dispatch`], there is **no relay fallback**:
+/// secrets are local-transport-only, per the architecture doc's M4 wire
+/// protocol section ("Secrets never ride the relay"). If the local endpoint
+/// can't be determined or reached, this returns a hard, clear error rather
+/// than silently trying the relay — the caller should tell the user to run
+/// the Bitwarden desktop app with Agent Access enabled.
+pub(super) async fn fetch_secret_dispatch(
+    query: &SecretQueryInput,
+    socket_override: Option<&str>,
+    delivery: Delivery,
+) -> Result<SecretRequestOutcome> {
+    let endpoint = match resolve_transport(socket_override) {
+        Transport::Local { endpoint, .. } => endpoint,
+        Transport::Relay => {
+            bail!(
+                "Could not determine the local Bitwarden agent-access endpoint. Secrets Manager \
+                 secrets are only available through the local Bitwarden desktop app — make sure \
+                 it is installed, running, unlocked, and Agent Access is enabled. There is no \
+                 relay fallback for secrets."
+            );
+        }
+    };
+
+    match local::request_secret(&endpoint, query, delivery.into()).await {
+        // Defense in depth: a local server that ignores `delivery:
+        // "reference"` and returns a value-bearing secret anyway must not
+        // have that value printed. Mirrors the equivalent credential guard
+        // above.
+        Ok(SecretOutcome::Secret(_)) if matches!(delivery, Delivery::Reference) => {
+            Err(color_eyre::eyre::eyre!(
+                "local agent-access endpoint returned a value-bearing response for a reference \
+                 secret request; refusing to print it"
+            ))
+        }
+        Ok(SecretOutcome::Secret(secret)) => Ok(SecretRequestOutcome::Secret(secret)),
+        Ok(SecretOutcome::Reference {
+            reference,
+            item_name,
+        }) => Ok(SecretRequestOutcome::Reference {
+            reference,
+            item_name,
+        }),
+        Err(LocalTransportError::ConnectFailed(_)) => Err(color_eyre::eyre::eyre!(
+            "Could not reach the Bitwarden desktop app locally. Secrets Manager secrets require \
+             the Bitwarden desktop app to be running, unlocked, and Agent Access enabled — there \
+             is no relay fallback for secrets."
+        )),
+        Err(e) => Err(color_eyre::eyre::eyre!(e)),
+    }
+}
+
+/// `aac connect --secret ...` / top-level `aac --secret ...` single-shot
+/// path. Always reference delivery: prints the `bw://secret/<id>` reference
+/// and the secret's name, never the value.
+async fn run_single_shot_secret(
+    secret: String,
+    output: OutputFormat,
+    socket_override: Option<String>,
+) -> Result<()> {
+    use super::output::{exit_code, exit_code_name};
+
+    let query = local::secret_query_from_flag(&secret);
+
+    match fetch_secret_dispatch(&query, socket_override.as_deref(), Delivery::Reference).await {
+        Ok(SecretRequestOutcome::Reference {
+            reference,
+            item_name,
+        }) => {
+            match output {
+                OutputFormat::Json => emit_json_secret_reference(&reference, item_name.as_deref()),
+                OutputFormat::Text => emit_text_secret_reference(&reference, item_name.as_deref()),
+            }
+            std::process::exit(exit_code::SUCCESS);
+        }
+        // Unreachable in practice: `fetch_secret_dispatch` already converts
+        // a value-bearing reply to a reference request into an `Err` above.
+        // Handled explicitly anyway so this match stays exhaustive and safe
+        // even if that guard is ever refactored.
+        Ok(SecretRequestOutcome::Secret(_)) => {
+            let msg = "local agent-access endpoint returned a value-bearing response for a \
+                        reference secret request; refusing to print it";
+            match output {
+                OutputFormat::Json => emit_json_error(msg, "local_transport_error"),
+                OutputFormat::Text => tracing::error!("{msg}"),
+            }
+            std::process::exit(exit_code::LOCAL_TRANSPORT_ERROR);
+        }
+        Err(e) => {
+            let code = exit_code_for_report(&e);
+            let msg = format!("{e}");
+            match output {
+                OutputFormat::Json => emit_json_error(&msg, exit_code_name(code)),
+                OutputFormat::Text => tracing::error!("{msg}"),
+            }
+            std::process::exit(code);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_single_shot(
     relay_url: String,
     token: Option<String>,
@@ -782,33 +1102,47 @@ async fn run_single_shot(
     query: ap_client::CredentialQuery,
     output: OutputFormat,
     timeout_secs: Option<u64>,
+    socket_override: Option<String>,
 ) -> Result<()> {
     use super::output::{exit_code, exit_code_name};
 
     let credential_timeout = timeout_secs.map(std::time::Duration::from_secs);
-    match fetch_credential(
+    match fetch_credential_dispatch(
         &relay_url,
         token.as_deref(),
         session_fingerprint.as_deref(),
         ephemeral_connection,
         &query,
         credential_timeout,
+        socket_override.as_deref(),
+        Delivery::Reference,
     )
     .await
     {
-        Ok(credential) => {
+        Ok(CredentialOutcome::Credential(credential)) => {
             match output {
                 OutputFormat::Json => emit_json_success(&credential),
                 OutputFormat::Text => emit_text_credential(&credential),
             }
             std::process::exit(exit_code::SUCCESS);
         }
+        Ok(CredentialOutcome::Reference {
+            reference,
+            item_name,
+            item_username,
+        }) => {
+            match output {
+                OutputFormat::Json => {
+                    emit_json_reference(&reference, item_name.as_deref(), item_username.as_deref())
+                }
+                OutputFormat::Text => {
+                    emit_text_reference(&reference, item_name.as_deref(), item_username.as_deref())
+                }
+            }
+            std::process::exit(exit_code::SUCCESS);
+        }
         Err(e) => {
-            // Try to extract a ClientError for specific exit codes
-            let code = e
-                .downcast_ref::<ap_client::ClientError>()
-                .map(exit_code_for_error)
-                .unwrap_or(exit_code::GENERAL_ERROR);
+            let code = exit_code_for_report(&e);
             let msg = format!("{e}");
             match output {
                 OutputFormat::Json => emit_json_error(&msg, exit_code_name(code)),
@@ -993,7 +1327,7 @@ mod tests {
     fn resolve_mode_no_cached_connections_errors() {
         let result = resolve_connection_mode(None, None, &[]);
         assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
+        let msg = format!("{}", result.expect_err("should be an error"));
         assert!(msg.contains("No cached connections found"));
     }
 
@@ -1002,15 +1336,16 @@ mod tests {
         let sessions = vec![connection(0xaa), connection(0xbb)];
         let result = resolve_connection_mode(None, None, &sessions);
         assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
+        let msg = format!("{}", result.expect_err("should be an error"));
         assert!(msg.contains("Multiple cached connections found"));
     }
 
     #[test]
     fn resolve_mode_connection_prefix_selects_existing() {
         let sessions = vec![connection(0xaa), connection(0xbb)];
-        let prefix = &hex::encode([0xaa; 32])[..8]; // first 8 chars
-        let mode = resolve_connection_mode(None, Some(prefix), &sessions).expect("should succeed");
+        let full = hex::encode([0xaa; 32]);
+        let prefix: String = full.chars().take(8).collect(); // first 8 chars
+        let mode = resolve_connection_mode(None, Some(&prefix), &sessions).expect("should succeed");
         assert!(matches!(
             mode,
             ConnectionMode::Existing {
@@ -1054,10 +1389,11 @@ mod tests {
     #[test]
     fn resolve_mode_session_and_token_both_provided_errors() {
         let sessions = vec![connection(0xaa), connection(0xbb)];
-        let prefix = &hex::encode([0xaa; 32])[..8];
-        let result = resolve_connection_mode(Some("ABC123DEF"), Some(prefix), &sessions);
+        let full = hex::encode([0xaa; 32]);
+        let prefix: String = full.chars().take(8).collect();
+        let result = resolve_connection_mode(Some("ABC123DEF"), Some(&prefix), &sessions);
         assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
+        let msg = format!("{}", result.expect_err("should be an error"));
         assert!(msg.contains("mutually exclusive"));
     }
 
@@ -1084,7 +1420,7 @@ mod tests {
         let sessions = vec![connection(0xaa), connection(0xab)];
         let result = resolve_connection_prefix("a", &sessions);
         assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
+        let msg = format!("{}", result.expect_err("should be an error"));
         assert!(msg.contains("Ambiguous"));
     }
 
@@ -1093,7 +1429,7 @@ mod tests {
         let sessions = vec![connection(0xaa)];
         let result = resolve_connection_prefix("ff", &sessions);
         assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
+        let msg = format!("{}", result.expect_err("should be an error"));
         assert!(msg.contains("No cached connection"));
     }
 
@@ -1102,7 +1438,7 @@ mod tests {
         let sessions = vec![connection(0xaa)];
         let result = resolve_connection_prefix("", &sessions);
         assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
+        let msg = format!("{}", result.expect_err("should be an error"));
         assert!(msg.contains("must not be empty"));
     }
 
@@ -1111,7 +1447,7 @@ mod tests {
         let sessions = vec![connection(0xaa)];
         let result = resolve_connection_prefix("zzzz", &sessions);
         assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
+        let msg = format!("{}", result.expect_err("should be an error"));
         assert!(msg.contains("hex string"));
     }
 
@@ -1163,7 +1499,7 @@ mod tests {
     fn rendezvous_empty_errors() {
         let result = validate_rendezvous_code("");
         assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
+        let msg = format!("{}", result.expect_err("should be an error"));
         assert!(msg.contains("required"));
     }
 
@@ -1171,7 +1507,7 @@ mod tests {
     fn rendezvous_wrong_length_errors() {
         let result = validate_rendezvous_code("AB");
         assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
+        let msg = format!("{}", result.expect_err("should be an error"));
         assert!(msg.contains("9 characters"));
     }
 
@@ -1179,7 +1515,7 @@ mod tests {
     fn rendezvous_non_alphanumeric_errors() {
         let result = validate_rendezvous_code("ABCDEF!@#");
         assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
+        let msg = format!("{}", result.expect_err("should be an error"));
         assert!(msg.contains("letters and numbers"));
     }
 
@@ -1196,7 +1532,7 @@ mod tests {
     fn fingerprint_wrong_length_errors() {
         let result = parse_fingerprint_hex("aabb");
         assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
+        let msg = format!("{}", result.expect_err("should be an error"));
         assert!(msg.contains("64 hex characters"));
     }
 
@@ -1206,5 +1542,295 @@ mod tests {
         let with_colons: String = (0..32).map(|_| "aa").collect::<Vec<_>>().join(":");
         let result = parse_fingerprint_hex(&with_colons).expect("should parse");
         assert_eq!(result, fp(0xaa));
+    }
+
+    // ── --secret CLI flag mutual exclusion (clap-level) ─────────────────
+
+    fn try_parse(args: &[&str]) -> std::result::Result<ConnectArgs, clap::Error> {
+        use clap::{Args as ClapArgs, FromArgMatches};
+        let cmd = ConnectArgs::augment_args(clap::Command::new("connect"));
+        let matches = cmd.try_get_matches_from(args)?;
+        ConnectArgs::from_arg_matches(&matches)
+    }
+
+    /// `ConnectArgs` doesn't derive `Debug`, so `Result::expect_err` isn't
+    /// available here either (see the equivalent helper in `run.rs`'s
+    /// tests).
+    fn expect_parse_error(args: &[&str]) -> clap::Error {
+        match try_parse(args) {
+            Ok(_) => panic!("expected a parse error for args: {args:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn secret_conflicts_with_domain() {
+        let err = expect_parse_error(&[
+            "connect",
+            "--domain",
+            "example.com",
+            "--secret",
+            "DB_PASSWORD",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn secret_conflicts_with_id() {
+        let err = expect_parse_error(&["connect", "--id", "item-1", "--secret", "DB_PASSWORD"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn secret_conflicts_with_search() {
+        let err = expect_parse_error(&["connect", "--search", "bank", "--secret", "DB_PASSWORD"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn domain_conflicts_with_secret() {
+        // Symmetric check: declaring --secret first must conflict too.
+        let err = expect_parse_error(&[
+            "connect",
+            "--secret",
+            "DB_PASSWORD",
+            "--domain",
+            "example.com",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn secret_alone_parses_ok() {
+        let parsed = try_parse(&["connect", "--secret", "DB_PASSWORD"]).expect("should parse");
+        assert_eq!(parsed.secret.as_deref(), Some("DB_PASSWORD"));
+        assert!(parsed.domain.is_none());
+    }
+}
+
+// ── local-transport defense-in-depth guard (finding #2) ────────────────
+//
+// A local server that ignores `delivery:"reference"` and replies with a
+// value-bearing credential anyway must never have those values surface
+// through `fetch_credential_dispatch` — `run_single_shot` prints whatever it
+// gets back for a `Reference`-delivery request. Mirrors the guard already
+// covered for the sibling corner case (`Reference`-for-`Inject`) in
+// `command/run.rs`, and for `Credential`-for-`Reference` in
+// `command/mcp.rs`'s `run_find_logins`.
+#[cfg(all(test, unix))]
+mod local_transport_guard_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+
+    use super::*;
+
+    fn unique_socket_path() -> String {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("/tmp/aac-connect-{}-{n}.sock", std::process::id() % 100_000)
+    }
+
+    /// Spawn a one-shot mock local-socket server (mirrors
+    /// `transport::local`'s and `command::mcp`'s test helpers): accepts one
+    /// connection, reads one request line, replies with the given canned
+    /// response line.
+    async fn spawn_mock_server(response_line: &'static str) -> String {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind mock socket");
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    match stream.read(&mut byte).await {
+                        Ok(0) => break,
+                        Ok(_) if byte[0] == b'\n' => break,
+                        Ok(_) => buf.push(byte[0]),
+                        Err(_) => break,
+                    }
+                }
+                let _: serde_json::Value =
+                    serde_json::from_slice(&buf).expect("mock received valid json");
+                let mut out = response_line.as_bytes().to_vec();
+                out.push(b'\n');
+                let _ = stream.write_all(&out).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        tokio::task::yield_now().await;
+        path
+    }
+
+    #[tokio::test]
+    async fn reference_delivery_rejects_value_bearing_credential_reply() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","credential":{"username":"u","password":"hunter2","totp":"654321","uri":"https://example.com","credentialId":"item-1"},"reference":"bw://item/item-1"}"#,
+        )
+        .await;
+
+        let result = fetch_credential_dispatch(
+            DEFAULT_RELAY_URL,
+            None,
+            None,
+            true,
+            &ap_client::CredentialQuery::Domain("example.com".to_string()),
+            None,
+            Some(&socket),
+            Delivery::Reference,
+        )
+        .await;
+
+        let err = result.expect_err("value-bearing credential for a reference request must error");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("hunter2"),
+            "secret leaked into error message: {msg}"
+        );
+        assert!(msg.contains("credential-bearing"));
+    }
+
+    /// Sanity check: a proper reference reply (no `credential` field) for a
+    /// reference-delivery request still succeeds normally — the guard above
+    /// must not reject the legitimate case.
+    #[tokio::test]
+    async fn reference_delivery_accepts_reference_reply() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","item":{"name":"Example","username":"u"},"reference":"bw://item/item-1"}"#,
+        )
+        .await;
+
+        let outcome = fetch_credential_dispatch(
+            DEFAULT_RELAY_URL,
+            None,
+            None,
+            true,
+            &ap_client::CredentialQuery::Domain("example.com".to_string()),
+            None,
+            Some(&socket),
+            Delivery::Reference,
+        )
+        .await
+        .expect("reference reply should succeed");
+
+        assert!(matches!(outcome, CredentialOutcome::Reference { .. }));
+    }
+
+    /// Sanity check: `Inject`-delivery requests are unaffected by the
+    /// reference-mode guard.
+    #[tokio::test]
+    async fn inject_delivery_still_accepts_credential_reply() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","credential":{"username":"u","password":"p","totp":"123456","uri":"https://example.com","credentialId":"item-1"},"reference":"bw://item/item-1"}"#,
+        )
+        .await;
+
+        let outcome = fetch_credential_dispatch(
+            DEFAULT_RELAY_URL,
+            None,
+            None,
+            true,
+            &ap_client::CredentialQuery::Domain("example.com".to_string()),
+            None,
+            Some(&socket),
+            Delivery::Inject,
+        )
+        .await
+        .expect("inject reply should succeed");
+
+        assert!(matches!(outcome, CredentialOutcome::Credential(_)));
+    }
+
+    // ── secretRequest dispatch / guards ─────────────────────────────────
+
+    #[tokio::test]
+    async fn secret_reference_delivery_rejects_value_bearing_reply() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","secret":{"name":"DB_PASSWORD","value":"hunter2","secretId":"secret-1"},"reference":"bw://secret/secret-1"}"#,
+        )
+        .await;
+
+        let result = fetch_secret_dispatch(
+            &SecretQueryInput::Name("DB_PASSWORD".to_string()),
+            Some(&socket),
+            Delivery::Reference,
+        )
+        .await;
+
+        let err = result.expect_err("value-bearing secret for a reference request must error");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("hunter2"),
+            "secret leaked into error message: {msg}"
+        );
+        assert!(msg.contains("value-bearing"));
+    }
+
+    /// Sanity check: a proper reference reply (no `secret` field) for a
+    /// reference-delivery request still succeeds normally.
+    #[tokio::test]
+    async fn secret_reference_delivery_accepts_reference_reply() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","item":{"name":"DB_PASSWORD"},"reference":"bw://secret/secret-1"}"#,
+        )
+        .await;
+
+        let outcome = fetch_secret_dispatch(
+            &SecretQueryInput::Name("DB_PASSWORD".to_string()),
+            Some(&socket),
+            Delivery::Reference,
+        )
+        .await
+        .expect("reference reply should succeed");
+
+        assert!(matches!(outcome, SecretRequestOutcome::Reference { .. }));
+    }
+
+    /// Sanity check: `Inject`-delivery requests are unaffected by the
+    /// reference-mode guard.
+    #[tokio::test]
+    async fn secret_inject_delivery_still_accepts_secret_reply() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","secret":{"name":"DB_PASSWORD","value":"hunter2","secretId":"secret-1"},"reference":"bw://secret/secret-1"}"#,
+        )
+        .await;
+
+        let outcome = fetch_secret_dispatch(
+            &SecretQueryInput::Name("DB_PASSWORD".to_string()),
+            Some(&socket),
+            Delivery::Inject,
+        )
+        .await
+        .expect("inject reply should succeed");
+
+        assert!(matches!(outcome, SecretRequestOutcome::Secret(_)));
+    }
+
+    /// Secrets never ride the relay: a local `ConnectFailed` must surface as
+    /// a hard error, never a silent relay fallback (unlike the credential
+    /// path's `Err(LocalTransportError::ConnectFailed(reason)) if !forced`
+    /// branch).
+    #[tokio::test]
+    async fn secret_connect_failed_does_not_fall_back_to_relay() {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+
+        let result = fetch_secret_dispatch(
+            &SecretQueryInput::Name("DB_PASSWORD".to_string()),
+            Some(&path),
+            Delivery::Reference,
+        )
+        .await;
+
+        let err = result.expect_err("unreachable local endpoint must be a hard error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no relay fallback") || msg.contains("Bitwarden desktop app"),
+            "error should explain the desktop app is required: {msg}"
+        );
     }
 }

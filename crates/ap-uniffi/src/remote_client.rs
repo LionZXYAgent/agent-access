@@ -436,10 +436,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn client_close_is_safe_before_connect() {
+    #[tokio::test]
+    async fn client_close_is_safe_before_connect() {
         let client = make_client();
-        client.close();
+        client.close().await;
     }
 
     #[tokio::test]

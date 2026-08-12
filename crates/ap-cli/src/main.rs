@@ -6,6 +6,7 @@
 mod command;
 pub(crate) mod providers;
 mod storage;
+mod transport;
 
 use clap::{CommandFactory, FromArgMatches};
 use color_eyre::eyre::Result;
@@ -19,10 +20,16 @@ use command::{Cli, Commands, process_command};
 fn is_tui_mode(cli: &Cli) -> bool {
     match &cli.command {
         Some(Commands::Listen(_)) => true,
-        Some(Commands::Connect(args)) => args.domain.is_none() && args.id.is_none(),
-        Some(Commands::Connections(_)) | Some(Commands::Run(_)) => false,
+        Some(Commands::Connect(args)) => {
+            args.domain.is_none() && args.id.is_none() && args.search.is_none()
+        }
+        Some(Commands::Connections(_))
+        | Some(Commands::Run(_))
+        | Some(Commands::Mcp(_))
+        | Some(Commands::Fill(_))
+        | Some(Commands::DescribeFillTarget(_)) => false,
         // Default (no subcommand) behaves like `connect`
-        None => cli.domain.is_none() && cli.id.is_none(),
+        None => cli.domain.is_none() && cli.id.is_none() && cli.search.is_none(),
     }
 }
 
@@ -58,6 +65,15 @@ async fn main() -> Result<()> {
             .with(tui_layer)
             .init();
         Some(rx)
+    } else if matches!(cli.command, Some(Commands::Mcp(_))) {
+        // MCP mode speaks JSON-RPC over stdout — logs must never land there,
+        // so this mode forces stderr regardless of the general non-TUI
+        // default writer.
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .init();
+        None
     } else {
         // Non-TUI mode: write logs to stderr as before
         tracing_subscriber::fmt().with_env_filter(env_filter).init();

@@ -246,11 +246,11 @@ async fn test_multiple_clients_same_identity_can_connect() {
     let mut client_b = RelayProtocolClient::from_url(format!("ws://{addr}"));
 
     let _incoming_a = client_a
-        .connect(IdentityKeyPair::from_cose(&cose_bytes).unwrap())
+        .connect(IdentityKeyPair::from_cose(&cose_bytes).expect("shared keypair should decode"))
         .await
         .expect("client A should connect");
     let _incoming_b = client_b
-        .connect(IdentityKeyPair::from_cose(&cose_bytes).unwrap())
+        .connect(IdentityKeyPair::from_cose(&cose_bytes).expect("shared keypair should decode"))
         .await
         .expect("client B should connect");
 
@@ -286,11 +286,11 @@ async fn test_messages_broadcast_to_all_same_identity_connections() {
     let mut sender_client = RelayProtocolClient::from_url(format!("ws://{addr}"));
 
     let mut incoming_user_a = user_client_a
-        .connect(IdentityKeyPair::from_cose(&user_cose).unwrap())
+        .connect(IdentityKeyPair::from_cose(&user_cose).expect("user keypair should decode"))
         .await
         .expect("user A should connect");
     let mut incoming_user_b = user_client_b
-        .connect(IdentityKeyPair::from_cose(&user_cose).unwrap())
+        .connect(IdentityKeyPair::from_cose(&user_cose).expect("user keypair should decode"))
         .await
         .expect("user B should connect");
     let _incoming_sender = sender_client
@@ -377,11 +377,11 @@ async fn test_cleanup_when_one_connection_disconnects() {
     let mut sender_client = RelayProtocolClient::from_url(format!("ws://{addr}"));
 
     let _incoming_user_a = user_client_a
-        .connect(IdentityKeyPair::from_cose(&user_cose).unwrap())
+        .connect(IdentityKeyPair::from_cose(&user_cose).expect("user keypair should decode"))
         .await
         .expect("user A should connect");
     let mut incoming_user_b = user_client_b
-        .connect(IdentityKeyPair::from_cose(&user_cose).unwrap())
+        .connect(IdentityKeyPair::from_cose(&user_cose).expect("user keypair should decode"))
         .await
         .expect("user B should connect");
     let _incoming_sender = sender_client

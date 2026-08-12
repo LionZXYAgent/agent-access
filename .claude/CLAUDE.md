@@ -67,7 +67,8 @@ crates/
 │       │   ├── tui_tracing.rs
 │       │   └── util.rs
 │       ├── providers/
-│       │   └── bitwarden.rs # bw CLI credential lookup
+│       │   ├── bitwarden.rs # bw CLI credential lookup
+│       │   └── bws.rs       # Bitwarden Secrets Manager SDK (in-process)
 │       └── storage/
 │           ├── session_storage.rs  # File-backed SessionStore
 │           └── identity_storage.rs # File-backed IdentityProvider
@@ -505,6 +506,8 @@ const CLIENT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120); // Relay d
 | `LLM` | No | Disables color output (set by agents) | unset |
 | `NO_COLOR` | No | Disables color output (standard) | unset |
 | `GIT_HASH` | No | Injected by CI for version string | unset |
+| `BWS_ACCESS_TOKEN` | No | Bitwarden Secrets Manager access token (`bws` provider) | unset |
+| `BWS_SERVER_URL` | No | Bitwarden Secrets Manager server URL (`bws` provider) | bitwarden.com cloud |
 
 ### Feature Flags
 

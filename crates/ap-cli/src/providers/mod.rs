@@ -4,11 +4,16 @@
 //! backends, and ships the built-in [`BitwardenProvider`].
 
 mod bitwarden;
+#[cfg(feature = "bws")]
+mod bws;
 mod example;
 
 use ap_client::CredentialData;
 pub use ap_client::CredentialQuery;
+use async_trait::async_trait;
 pub use bitwarden::BitwardenProvider;
+#[cfg(feature = "bws")]
+pub use bws::BwsProvider;
 use color_eyre::eyre::{Result, bail};
 pub use example::ExampleProvider;
 
@@ -45,30 +50,39 @@ pub enum LookupResult {
 /// Implementations back different password managers (Bitwarden CLI, 1Password,
 /// etc.) behind a uniform interface so the listen command can work with any of
 /// them.
+#[async_trait]
 pub trait CredentialProvider: Send + Sync {
     /// Human-readable name shown in the TUI header (e.g. "Bitwarden").
     fn name(&self) -> &str;
 
     /// Check current readiness.
-    fn status(&self) -> ProviderStatus;
+    async fn status(&self) -> ProviderStatus;
 
     /// Attempt to unlock the provider.
     ///
     /// The semantics of `input` are provider-specific. For Bitwarden it may be
     /// a master password *or* a raw session key — the implementation
     /// auto-detects which.
-    fn unlock(&mut self, input: &str) -> Result<(), String>;
+    async fn unlock(&mut self, input: &str) -> Result<(), String>;
 
     /// Look up a credential.
-    fn lookup(&self, query: &CredentialQuery) -> LookupResult;
+    async fn lookup(&self, query: &CredentialQuery) -> LookupResult;
 }
 
 /// Create a provider by name.
 pub fn create_provider(name: &str) -> Result<Box<dyn CredentialProvider>> {
     match name {
         "bitwarden" => Ok(Box::new(BitwardenProvider::new())),
+        #[cfg(feature = "bws")]
+        "bws" | "bitwarden-sm" => Ok(Box::new(BwsProvider::new())),
+        #[cfg(not(feature = "bws"))]
+        "bws" | "bitwarden-sm" => {
+            bail!(
+                "This build of aac was compiled without the 'bws' feature (Bitwarden Secrets Manager provider)"
+            )
+        }
         "example" => Ok(Box::new(ExampleProvider::new())),
-        _ => bail!("Unknown credential provider: '{name}'. Available: bitwarden, example"),
+        _ => bail!("Unknown credential provider: '{name}'. Available: bitwarden, bws, example"),
     }
 }
 
@@ -109,12 +123,13 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl CredentialProvider for MockProvider {
         fn name(&self) -> &str {
             self.name
         }
 
-        fn status(&self) -> ProviderStatus {
+        async fn status(&self) -> ProviderStatus {
             match &self.status {
                 ProviderStatus::Ready { user_info } => ProviderStatus::Ready {
                     user_info: user_info.clone(),
@@ -132,11 +147,11 @@ mod tests {
             }
         }
 
-        fn unlock(&mut self, _input: &str) -> Result<(), String> {
+        async fn unlock(&mut self, _input: &str) -> Result<(), String> {
             self.unlock_result.clone()
         }
 
-        fn lookup(&self, query: &CredentialQuery) -> LookupResult {
+        async fn lookup(&self, query: &CredentialQuery) -> LookupResult {
             match self.credentials.get(query.search_string()) {
                 Some(cred) => LookupResult::Found(cred.clone()),
                 None => LookupResult::NotFound,
@@ -150,6 +165,22 @@ mod tests {
     fn create_provider_bitwarden() {
         let provider = create_provider("bitwarden").expect("should create bitwarden provider");
         assert_eq!(provider.name(), "Bitwarden");
+    }
+
+    #[cfg(feature = "bws")]
+    #[test]
+    fn create_provider_bws() {
+        let provider = create_provider("bws").expect("should create bws provider");
+        assert_eq!(provider.name(), "Bitwarden Secrets Manager");
+    }
+
+    #[cfg(not(feature = "bws"))]
+    #[test]
+    fn create_provider_bws_reports_missing_feature() {
+        match create_provider("bws") {
+            Err(e) => assert!(format!("{e}").contains("'bws' feature")),
+            Ok(_) => panic!("bws provider should not be compiled in"),
+        }
     }
 
     #[test]
@@ -185,10 +216,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mock_lookup_found() {
+    #[tokio::test]
+    async fn mock_lookup_found() {
         let provider = MockProvider::new().with_credential("example.com", sample_credential());
-        match provider.lookup(&CredentialQuery::Domain("example.com".to_string())) {
+        match provider
+            .lookup(&CredentialQuery::Domain("example.com".to_string()))
+            .await
+        {
             LookupResult::Found(cred) => {
                 assert_eq!(cred.username.as_deref(), Some("alice"));
                 assert_eq!(cred.password.as_deref().map(String::as_str), Some("s3cret"));
@@ -197,25 +231,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mock_lookup_not_found() {
+    #[tokio::test]
+    async fn mock_lookup_not_found() {
         let provider = MockProvider::new();
         assert!(matches!(
-            provider.lookup(&CredentialQuery::Domain("unknown.com".to_string())),
+            provider
+                .lookup(&CredentialQuery::Domain("unknown.com".to_string()))
+                .await,
             LookupResult::NotFound
         ));
     }
 
-    #[test]
-    fn mock_unlock_success() {
+    #[tokio::test]
+    async fn mock_unlock_success() {
         let mut provider = MockProvider::new();
-        assert!(provider.unlock("anything").is_ok());
+        assert!(provider.unlock("anything").await.is_ok());
     }
 
-    #[test]
-    fn mock_unlock_error() {
+    #[tokio::test]
+    async fn mock_unlock_error() {
         let mut provider = MockProvider::new().with_unlock_error("vault sealed");
-        let err = provider.unlock("anything").unwrap_err();
+        let err = provider
+            .unlock("anything")
+            .await
+            .expect_err("unlock should fail");
         assert_eq!(err, "vault sealed");
     }
 
@@ -225,9 +264,12 @@ mod tests {
         assert_eq!(provider.name(), "Mock");
     }
 
-    #[test]
-    fn mock_status_ready() {
+    #[tokio::test]
+    async fn mock_status_ready() {
         let provider = MockProvider::new();
-        assert!(matches!(provider.status(), ProviderStatus::Ready { .. }));
+        assert!(matches!(
+            provider.status().await,
+            ProviderStatus::Ready { .. }
+        ));
     }
 }

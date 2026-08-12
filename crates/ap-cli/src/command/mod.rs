@@ -5,8 +5,12 @@
 
 mod connect;
 mod connections;
+mod fill;
+mod findings_artifact;
 mod listen;
+mod mcp;
 pub(crate) mod output;
+mod redact;
 mod run;
 pub(crate) mod tui;
 pub(crate) mod tui_tracing;
@@ -23,7 +27,9 @@ use tui_tracing::LogReceiver;
 
 pub use connect::ConnectArgs;
 pub use connections::ConnectionsArgs;
+pub use fill::{DescribeFillTargetArgs, FillArgs};
 pub use listen::ListenArgs;
+pub use mcp::McpArgs;
 pub use run::RunArgs;
 
 const DEFAULT_RELAY_URL: &str = "wss://ap.lesspassword.dev";
@@ -121,12 +127,30 @@ pub struct Cli {
     pub verbose: bool,
 
     /// Domain to request credentials for (single-shot, non-interactive)
-    #[arg(long, conflicts_with = "id")]
+    #[arg(long, conflicts_with_all = ["id", "search", "secret"])]
     pub domain: Option<String>,
 
-    /// Vault item ID to request credentials for (single-shot, non-interactive)
-    #[arg(long, conflicts_with = "domain")]
+    /// Vault item ID to request credentials for (single-shot, non-interactive).
+    /// Accepts a bare id or a `bw://item/<id>` reference.
+    #[arg(long, conflicts_with_all = ["domain", "search", "secret"])]
     pub id: Option<String>,
+
+    /// Free-text search for credentials (single-shot, non-interactive)
+    #[arg(long, conflicts_with_all = ["domain", "id", "secret"])]
+    pub search: Option<String>,
+
+    /// Secrets Manager secret name or `bw://secret/<id>` reference
+    /// (single-shot, non-interactive). Local transport only — there is no
+    /// relay fallback for secrets. Always reference delivery: prints the
+    /// `bw://secret/<id>` reference and the secret's name, never the value.
+    #[arg(long, conflicts_with_all = ["domain", "id", "search"])]
+    pub secret: Option<String>,
+
+    /// Local agent-access endpoint to use instead of the platform default
+    /// (unix socket path / windows pipe name). Forces the local transport:
+    /// fails rather than falling back to the relay if unreachable.
+    #[arg(long, env = "AAC_SOCKET", global = true)]
+    pub socket: Option<String>,
 
     /// Output format (text or json) for single-shot mode
     #[arg(long, default_value = "text", value_enum, global = true)]
@@ -143,6 +167,17 @@ pub enum Commands {
     Connections(ConnectionsArgs),
     /// Fetch a credential and run a command with it injected as env vars
     Run(RunArgs),
+    /// Run as an MCP (Model Context Protocol) server over stdio, exposing
+    /// `find_logins`/`run_with_credential` tools to AI agents (Claude Code,
+    /// Cursor, ...)
+    Mcp(McpArgs),
+    /// Fill a Bitwarden login into the active tab of the user's browser via
+    /// the desktop app and browser extension. Local-socket-only — there is
+    /// no relay fallback.
+    Fill(FillArgs),
+    /// Describe the login form in the active tab of the user's browser: no
+    /// vault access, no approval, no value.
+    DescribeFillTarget(DescribeFillTargetArgs),
 }
 
 /// Process the parsed command and execute the appropriate handler
@@ -152,8 +187,13 @@ pub async fn process_command(cli: Cli, log_rx: Option<LogReceiver>) -> Result<()
         Some(Commands::Connect(args)) => args.run(log_rx).await,
         Some(Commands::Listen(args)) => args.run(log_rx).await,
         Some(Commands::Run(args)) => args.run().await,
+        Some(Commands::Mcp(args)) => args.run().await,
+        Some(Commands::Fill(args)) => args.run().await,
+        Some(Commands::DescribeFillTarget(args)) => args.run().await,
         None if cli.domain.is_some()
             || cli.id.is_some()
+            || cli.search.is_some()
+            || cli.secret.is_some()
             || cli.token.is_some()
             || cli.session.is_some() =>
         {
@@ -166,6 +206,9 @@ pub async fn process_command(cli: Cli, log_rx: Option<LogReceiver>) -> Result<()
                 verify_fingerprint: cli.verify_fingerprint,
                 domain: cli.domain,
                 id: cli.id,
+                search: cli.search,
+                secret: cli.secret,
+                socket: cli.socket,
                 timeout: None,
                 output: cli.output,
             };

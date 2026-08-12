@@ -26,9 +26,9 @@ fn main() -> Result<(), ap_noise::NoiseProtocolError> {
 
     // Run the handshake steps
     let msg1 = initiator.send_start()?;
-    let _ = responder.receive_start(&msg1)?;
+    responder.receive_start(&msg1)?;
     let msg2 = responder.send_finish()?;
-    let _ = initiator.receive_finish(&msg2)?;
+    initiator.receive_finish(&msg2)?;
     let (mut transport_initiator, fingerprint_initiator) = initiator.finalize()?;
     let (mut transport_responder, fingerprint_responder) = responder.finalize()?;
 

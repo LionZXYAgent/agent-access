@@ -708,10 +708,9 @@ async fn test_fingerprint_pairing_both_sides_verify() {
 
     // Spawn task to auto-approve fingerprint on the REMOTE side via request channel
     let remote_approval_task = tokio::spawn(async move {
-        while let Some(request) = remote_request_rx.recv().await {
+        if let Some(request) = remote_request_rx.recv().await {
             let RemoteClientRequest::VerifyFingerprint { reply, .. } = request;
             let _ = reply.send(RemoteClientFingerprintReply { approved: true });
-            break;
         }
         remote_notification_rx
     });
@@ -1165,15 +1164,13 @@ async fn test_credential_request_buffered_during_fingerprint_verification() {
                 .expect("Pairing should succeed");
 
             // Immediately request a credential — the UserClient hasn't approved yet
-            let credential = remote_client
+            remote_client
                 .request_credential(
                     &ap_client::CredentialQuery::Domain("buffered.example.com".to_string()),
                     None,
                 )
                 .await
-                .expect("Credential request should succeed after fingerprint approval");
-
-            credential
+                .expect("Credential request should succeed after fingerprint approval")
         })
     };
 

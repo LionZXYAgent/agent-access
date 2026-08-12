@@ -6,6 +6,7 @@
 use std::process::Command;
 
 use ap_client::CredentialData;
+use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString, zeroize::Zeroizing};
 use serde::Deserialize;
 use tracing::info;
@@ -219,12 +220,13 @@ impl BitwardenProvider {
     }
 }
 
+#[async_trait]
 impl CredentialProvider for BitwardenProvider {
     fn name(&self) -> &str {
         "Bitwarden"
     }
 
-    fn status(&self) -> ProviderStatus {
+    async fn status(&self) -> ProviderStatus {
         let bw = match &self.bw_path {
             Some(p) => p,
             None => {
@@ -254,7 +256,7 @@ impl CredentialProvider for BitwardenProvider {
         }
     }
 
-    fn unlock(&mut self, input: &str) -> Result<(), String> {
+    async fn unlock(&mut self, input: &str) -> Result<(), String> {
         let bw = self.bw_path.as_deref().ok_or("Bitwarden CLI not found")?;
 
         if looks_like_session_key(input) {
@@ -273,7 +275,7 @@ impl CredentialProvider for BitwardenProvider {
         Ok(())
     }
 
-    fn lookup(&self, query: &CredentialQuery) -> LookupResult {
+    async fn lookup(&self, query: &CredentialQuery) -> LookupResult {
         let bw = match &self.bw_path {
             Some(p) => p,
             None => {
@@ -325,7 +327,8 @@ mod tests {
     fn session_key_rejects_wrong_length_and_bad_chars() {
         assert!(!looks_like_session_key(""));
         assert!(!looks_like_session_key("short"));
-        assert!(!looks_like_session_key(&VALID_KEY[..87])); // too short
+        let short: String = VALID_KEY.chars().take(87).collect();
+        assert!(!looks_like_session_key(&short)); // too short
         assert!(!looks_like_session_key("alligator5")); // typical password
         // 88 chars but contains a space
         let mut bad = VALID_KEY.to_string();

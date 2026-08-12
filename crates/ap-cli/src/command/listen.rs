@@ -101,7 +101,7 @@ pub struct ListenArgs {
     #[arg(long, conflicts_with = "psk")]
     pub reusable_psk: bool,
 
-    /// Credential provider to use
+    /// Credential provider to use (bitwarden, bws, example)
     #[arg(long, default_value = "bitwarden")]
     pub provider: String,
 }
@@ -223,7 +223,7 @@ fn connection_info_messages(
     pending_label: Option<&str>,
 ) -> Vec<Message> {
     let mut sorted = sessions.to_vec();
-    sorted.sort_by(|a, b| b.last_connected_at.cmp(&a.last_connected_at));
+    sorted.sort_by_key(|c| std::cmp::Reverse(c.last_connected_at));
 
     let mut msgs = vec![Message::rich(
         MessageKind::Listening,
@@ -364,9 +364,9 @@ async fn run_event_loop(
                                         term.draw(|frame| app.draw(frame))
                                             .map_err(|e| color_eyre::eyre::eyre!("TUI draw error: {}", e))?;
 
-                                        match provider.unlock(&input) {
+                                        match provider.unlock(&input).await {
                                             Ok(()) => {
-                                                let status = provider.status();
+                                                let status = provider.status().await;
                                                 apply_status_spans(app, provider.name(), &status);
                                                 app.push_msg(MessageKind::Success, "Vault unlocked successfully");
                                             }
@@ -553,7 +553,7 @@ async fn run_event_loop(
                         UserClientRequest::CredentialRequest { query, identity, reply } => {
                             // Check auto-approval cache first
                             if approval_cache.is_approved(&identity, &query) {
-                                match provider.lookup(&query) {
+                                match provider.lookup(&query).await {
                                     LookupResult::Found(credential) => {
                                         let label = credential.domain.clone().unwrap_or_else(|| query.to_string());
                                         let cred_id = credential.credential_id.clone();
@@ -584,7 +584,7 @@ async fn run_event_loop(
                                     ],
                                 ));
 
-                                match provider.lookup(&query) {
+                                match provider.lookup(&query).await {
                                     LookupResult::Found(credential) => {
                                         let domain = credential.domain.clone().unwrap_or_else(|| query.to_string());
                                         let found_msg = format!(
@@ -684,7 +684,7 @@ async fn run_user_client_loop(
     app.client_label = "User client";
 
     // Show initial provider status (single status() call)
-    let initial_status = provider.status();
+    let initial_status = provider.status().await;
     let name = provider.name();
     match &initial_status {
         ProviderStatus::Ready { .. } => {}
