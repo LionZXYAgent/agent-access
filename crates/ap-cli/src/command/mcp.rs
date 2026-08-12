@@ -484,7 +484,15 @@ In particular, to log into a website in the user's browser, call `fill_credentia
 site's domain. It resolves the login itself, so `find_logins` beforehand is a second approval prompt \
 that buys nothing — and unlike `fill_credential`, `find_logins` does release vault data to you (an \
 item name and username). Look a login up first only when you genuinely need to show the user what \
-matched, or to disambiguate between several accounts on one site.";
+matched, or to disambiguate between several accounts on one site.
+
+To remove a hardcoded credential or secret from source code: find the literal, then store it with \
+create_secret (you already know the value) or generate_secret (Bitwarden generates it inside the \
+desktop app — you never see it), optionally into a project from list_projects/create_project. \
+Replace the literal in code with the returned reference or UUID and wire up the Bitwarden Secrets \
+Manager SDK — or use run_with_secret to inject the real value at runtime without ever seeing it \
+yourself. To rotate an existing secret, call update_secret with generate: true instead of supplying \
+'value' yourself, so the new value is generated and stored without ever passing through you.";
 
 fn initialize_result() -> Value {
     json!({
@@ -508,6 +516,13 @@ fn tools_list_result() -> Value {
         find_secrets_tool_def(),
         run_with_secret_tool_def(),
         create_secret_tool_def(),
+        generate_secret_tool_def(),
+        update_secret_tool_def(),
+        delete_secret_tool_def(),
+        list_projects_tool_def(),
+        create_project_tool_def(),
+        update_project_tool_def(),
+        delete_project_tool_def(),
         get_secret_findings_tool_def(),
         fill_credential_tool_def(),
         describe_fill_target_tool_def(),
@@ -754,6 +769,236 @@ fn create_secret_tool_def() -> Value {
     })
 }
 
+// ── M6-A: generate_secret / update_secret / delete_secret / projects ────
+
+fn generate_secret_tool_def() -> Value {
+    json!({
+        "name": "generate_secret",
+        "description": "Create a new Bitwarden Secrets Manager secret with a strong random \
+            value generated inside the Bitwarden desktop app and encrypted before storage. The \
+            generated value is never shown to you and cannot be retrieved through this \
+            interface — use run_with_secret to inject it into a command's environment, and the \
+            returned reference/UUID to wire up the Bitwarden Secrets Manager SDK in your code. \
+            Requires the user to approve this request in the Bitwarden desktop app, which must \
+            be open and unlocked — the call fails if it isn't. Prefer this over create_secret \
+            whenever the caller doesn't need to choose the value itself.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name (key) for the new secret."},
+                "note": {
+                    "type": "string",
+                    "description": "Optional note stored alongside the secret.",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Optional project name hint. This is only a hint: the user \
+                        always sees and can change the selected project in the approval dialog \
+                        before the secret is created.",
+                },
+                "length": {
+                    "type": "integer",
+                    "minimum": 12,
+                    "maximum": 128,
+                    "default": 40,
+                    "description": "Length of the generated value, between 12 and 128. \
+                        Defaults to 40.",
+                },
+                "symbols": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Whether the generated value includes symbol characters in \
+                        addition to letters and digits. Defaults to true.",
+                },
+            },
+            "required": ["name"],
+            "additionalProperties": false,
+        },
+    })
+}
+
+fn update_secret_tool_def() -> Value {
+    json!({
+        "name": "update_secret",
+        "description": "Update an existing Bitwarden Secrets Manager secret: rename it, change \
+            its value, move it to a different project, or change its note. Provide exactly one \
+            of 'secretId' or 'reference' to identify the secret, and at least one change field. \
+            Provide at most one of 'value' or 'generate' — for rotation, prefer generate: true \
+            over supplying 'value' yourself, so the new value is generated inside the Bitwarden \
+            desktop app and never passes through you; renaming or moving a secret never exposes \
+            its value to anyone, including you. Requires the user to approve this request in \
+            the Bitwarden desktop app, which must be open and unlocked — the call fails if it \
+            isn't. The secret's value is never included in this tool's result or in any error \
+            message.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "secretId": {
+                    "type": "string",
+                    "description": "UUID of the secret to update. Mutually exclusive with \
+                        'reference'; exactly one is required.",
+                },
+                "reference": {
+                    "type": "string",
+                    "description": "A bw://secret/<id> reference. Mutually exclusive with \
+                        'secretId'; exactly one is required.",
+                },
+                "name": {"type": "string", "description": "New name for the secret."},
+                "value": {
+                    "type": "string",
+                    "description": "New value to store. Mutually exclusive with 'generate'. \
+                        Encrypted before storage; never returned by this tool.",
+                },
+                "generate": {
+                    "type": "boolean",
+                    "description": "Generate a new random value inside the Bitwarden desktop \
+                        app instead of supplying 'value'. The generated value is never shown to \
+                        you. Mutually exclusive with 'value'.",
+                },
+                "length": {
+                    "type": "integer",
+                    "minimum": 12,
+                    "maximum": 128,
+                    "description": "Length of the generated value, between 12 and 128. Only \
+                        used when 'generate' is true; defaults to 40.",
+                },
+                "symbols": {
+                    "type": "boolean",
+                    "description": "Whether the generated value includes symbols. Only used \
+                        when 'generate' is true; defaults to true.",
+                },
+                "note": {
+                    "type": "string",
+                    "description": "New note for the secret. An empty string clears the \
+                        existing note.",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Project name hint to move the secret to. This is only a \
+                        hint: the user always sees and can change the selected project in the \
+                        approval dialog.",
+                },
+            },
+            "additionalProperties": false,
+        },
+    })
+}
+
+fn delete_secret_tool_def() -> Value {
+    json!({
+        "name": "delete_secret",
+        "description": "Delete a Bitwarden Secrets Manager secret. This moves the secret to \
+            the Secrets Manager trash — it is not destroyed immediately, and an organization \
+            admin can restore it. Provide exactly one of 'secretId' or 'reference'. Requires \
+            the user to approve this request in the Bitwarden desktop app, which must be open \
+            and unlocked — the call fails if it isn't.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "secretId": {
+                    "type": "string",
+                    "description": "UUID of the secret to delete. Mutually exclusive with \
+                        'reference'; exactly one is required.",
+                },
+                "reference": {
+                    "type": "string",
+                    "description": "A bw://secret/<id> reference. Mutually exclusive with \
+                        'secretId'; exactly one is required.",
+                },
+            },
+            "additionalProperties": false,
+        },
+    })
+}
+
+fn list_projects_tool_def() -> Value {
+    json!({
+        "name": "list_projects",
+        "description": "List every Bitwarden Secrets Manager project the user can read, across \
+            all of their Secrets Manager organizations. A single approval in the Bitwarden \
+            desktop app releases the full list for this one call — project names are \
+            organization metadata, not secret material. Requires the user to approve this \
+            request in the Bitwarden desktop app, which must be open and unlocked — the call \
+            fails if it isn't. Use the returned projectId/reference as the 'project' hint for \
+            create_secret, generate_secret, or update_secret.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+    })
+}
+
+fn create_project_tool_def() -> Value {
+    json!({
+        "name": "create_project",
+        "description": "Create a new Bitwarden Secrets Manager project. Requires the user to \
+            approve this request in the Bitwarden desktop app, which must be open and unlocked \
+            — the call fails if it isn't. Use the returned projectId/reference as the 'project' \
+            hint for create_secret, generate_secret, or update_secret.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name for the new project."},
+            },
+            "required": ["name"],
+            "additionalProperties": false,
+        },
+    })
+}
+
+fn update_project_tool_def() -> Value {
+    json!({
+        "name": "update_project",
+        "description": "Rename a Bitwarden Secrets Manager project. Provide exactly one of \
+            'projectId' or 'reference' to identify the project. Requires the user to approve \
+            this request in the Bitwarden desktop app, which must be open and unlocked — the \
+            call fails if it isn't.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "projectId": {
+                    "type": "string",
+                    "description": "UUID of the project to rename. Mutually exclusive with \
+                        'reference'; exactly one is required.",
+                },
+                "reference": {
+                    "type": "string",
+                    "description": "A bw://project/<id> reference. Mutually exclusive with \
+                        'projectId'; exactly one is required.",
+                },
+                "name": {"type": "string", "description": "New name for the project."},
+            },
+            "required": ["name"],
+            "additionalProperties": false,
+        },
+    })
+}
+
+fn delete_project_tool_def() -> Value {
+    json!({
+        "name": "delete_project",
+        "description": "Delete a Bitwarden Secrets Manager project. This is permanent: unlike \
+            deleting a secret, there is no trash and no restore. Secrets inside the project are \
+            NOT deleted, but they lose the project and may become inaccessible to non-admin \
+            users. Provide exactly one of 'projectId' or 'reference'. Requires the user to \
+            approve this request in the Bitwarden desktop app, which must be open and unlocked \
+            — the call fails if it isn't.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "projectId": {
+                    "type": "string",
+                    "description": "UUID of the project to delete. Mutually exclusive with \
+                        'reference'; exactly one is required.",
+                },
+                "reference": {
+                    "type": "string",
+                    "description": "A bw://project/<id> reference. Mutually exclusive with \
+                        'projectId'; exactly one is required.",
+                },
+            },
+            "additionalProperties": false,
+        },
+    })
+}
+
 /// Compatibility path for MCP clients that don't surface resources (plan
 /// §3). Description deliberately spells out every property an agent needs
 /// to act correctly on a finding without the model having to infer it: the
@@ -885,6 +1130,13 @@ async fn handle_tools_call(
         "find_secrets" => run_find_secrets(arguments, socket_override).await,
         "run_with_secret" => run_with_secret_tool(arguments, socket_override).await,
         "create_secret" => run_create_secret(arguments, socket_override).await,
+        "generate_secret" => run_generate_secret(arguments, socket_override).await,
+        "update_secret" => run_update_secret(arguments, socket_override).await,
+        "delete_secret" => run_delete_secret(arguments, socket_override).await,
+        "list_projects" => run_list_projects(socket_override).await,
+        "create_project" => run_create_project(arguments, socket_override).await,
+        "update_project" => run_update_project(arguments, socket_override).await,
+        "delete_project" => run_delete_project(arguments, socket_override).await,
         "get_secret_findings" => run_get_secret_findings(context),
         "fill_credential" => run_fill_credential(arguments, socket_override).await,
         "describe_fill_target" => run_describe_fill_target(socket_override).await,
@@ -1311,7 +1563,8 @@ async fn run_create_secret(arguments: Value, socket_override: &Option<String>) -
 
     let input = SecretCreateInput {
         name: args.name,
-        value: args.value,
+        value: Some(args.value),
+        generate: None,
         note: args.note,
         project: args.project,
     };
@@ -1323,6 +1576,436 @@ async fn run_create_secret(arguments: Value, socket_override: &Option<String>) -
                 "reference": outcome.reference,
                 "name": outcome.name,
             });
+            (result.to_string(), false)
+        }
+        Err(e) => (map_local_error_to_tool_message(&e), true),
+    }
+}
+
+// ── M6-A: generate_secret / update_secret / delete_secret / projects ────
+
+/// Resolve exactly one of an `{id, reference}` pair into a bare id, stripping
+/// `strip` from `reference` if present. Shared by every M6 tool that accepts
+/// `{fooId? | reference?}` (architecture doc, M6-A: "exactly one of
+/// secretId/reference where both allowed").
+fn resolve_one_of_id_or_reference(
+    id: Option<String>,
+    reference: Option<String>,
+    strip: fn(&str) -> &str,
+    id_field: &str,
+) -> Result<String, String> {
+    match (id, reference) {
+        (Some(_), Some(_)) => Err(format!(
+            "Provide exactly one of '{id_field}' or 'reference', not both."
+        )),
+        (None, None) => Err(format!(
+            "Provide exactly one of '{id_field}' or 'reference'."
+        )),
+        (Some(id), None) => {
+            if id.trim().is_empty() {
+                Err(format!("The '{id_field}' argument must not be empty."))
+            } else {
+                Ok(id)
+            }
+        }
+        (None, Some(r)) => {
+            let id = strip(&r);
+            if id.is_empty() {
+                Err("The 'reference' argument must not be empty.".to_string())
+            } else {
+                Ok(id.to_string())
+            }
+        }
+    }
+}
+
+// ── generate_secret ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct GenerateSecretArgs {
+    name: String,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    length: Option<u32>,
+    #[serde(default)]
+    symbols: Option<bool>,
+}
+
+/// Run `generate_secret`. Returns `(text, isError)`; `text` is JSON-encoded
+/// `{secretId, reference, name}` on success. The generated value is never
+/// placed in `text` or in any error message — it is never even asked for:
+/// this tool never carries a `value` argument, so the value never exists in
+/// this process at all (architecture doc, M6).
+async fn run_generate_secret(arguments: Value, socket_override: &Option<String>) -> (String, bool) {
+    let args: GenerateSecretArgs = match serde_json::from_value(arguments) {
+        Ok(a) => a,
+        Err(e) => return (format!("Invalid arguments for generate_secret: {e}"), true),
+    };
+    if args.name.trim().is_empty() {
+        return ("The 'name' argument must not be empty.".to_string(), true);
+    }
+    if let Err(msg) = local::validate_generate_length(args.length) {
+        return (msg, true);
+    }
+
+    let endpoint = match resolve_endpoint(socket_override) {
+        Some(e) => e,
+        None => return (LOCAL_UNAVAILABLE_MSG.to_string(), true),
+    };
+
+    let input = SecretCreateInput {
+        name: args.name,
+        value: None,
+        generate: Some(local::WireGenerateOptions {
+            length: args.length,
+            symbols: args.symbols,
+        }),
+        note: args.note,
+        project: args.project,
+    };
+
+    match local::request_secret_create(&endpoint, &input).await {
+        Ok(outcome) => {
+            let result = json!({
+                "secretId": outcome.secret_id,
+                "reference": outcome.reference,
+                "name": outcome.name,
+            });
+            (result.to_string(), false)
+        }
+        Err(e) => (map_local_error_to_tool_message(&e), true),
+    }
+}
+
+// ── update_secret ────────────────────────────────────────────────────────
+
+/// Deliberately does not derive `Debug` — `value` is a `Zeroizing<String>`,
+/// which prints its contents plainly via `Debug`; not deriving it here
+/// removes the possibility of an accidental future `{:?}` leaking it (same
+/// discipline as `CreateSecretArgs`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSecretArgs {
+    #[serde(default)]
+    secret_id: Option<String>,
+    #[serde(default)]
+    reference: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    value: Option<Zeroizing<String>>,
+    #[serde(default)]
+    generate: Option<bool>,
+    #[serde(default)]
+    length: Option<u32>,
+    #[serde(default)]
+    symbols: Option<bool>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// Run `update_secret`. Returns `(text, isError)`; `text` is JSON-encoded
+/// `{secretId, reference, name}` on success. The secret's value (whether
+/// supplied via `value` or born from `generate`) is never placed in `text`
+/// or in any error message.
+async fn run_update_secret(arguments: Value, socket_override: &Option<String>) -> (String, bool) {
+    let args: UpdateSecretArgs = match serde_json::from_value(arguments) {
+        Ok(a) => a,
+        Err(e) => return (format!("Invalid arguments for update_secret: {e}"), true),
+    };
+
+    let target_id = match resolve_one_of_id_or_reference(
+        args.secret_id,
+        args.reference,
+        local::strip_secret_reference,
+        "secretId",
+    ) {
+        Ok(id) => id,
+        Err(msg) => return (msg, true),
+    };
+
+    if let Some(name) = &args.name {
+        if name.trim().is_empty() {
+            return ("The 'name' argument must not be empty.".to_string(), true);
+        }
+    }
+    if let Some(value) = &args.value {
+        if value.as_str().is_empty() {
+            return ("The 'value' argument must not be empty.".to_string(), true);
+        }
+    }
+    if args.value.is_some() && args.generate == Some(true) {
+        return (
+            "Provide at most one of 'value' or 'generate', not both.".to_string(),
+            true,
+        );
+    }
+    if (args.length.is_some() || args.symbols.is_some()) && args.generate != Some(true) {
+        return (
+            "'length'/'symbols' require 'generate' to be true.".to_string(),
+            true,
+        );
+    }
+    if let Err(msg) = local::validate_generate_length(args.length) {
+        return (msg, true);
+    }
+
+    let generate = if args.generate == Some(true) {
+        Some(local::WireGenerateOptions {
+            length: args.length,
+            symbols: args.symbols,
+        })
+    } else {
+        None
+    };
+
+    if args.name.is_none()
+        && args.value.is_none()
+        && generate.is_none()
+        && args.note.is_none()
+        && args.project.is_none()
+    {
+        return (
+            "Provide at least one change: 'name', 'value', 'generate', 'note', or 'project'."
+                .to_string(),
+            true,
+        );
+    }
+
+    let endpoint = match resolve_endpoint(socket_override) {
+        Some(e) => e,
+        None => return (LOCAL_UNAVAILABLE_MSG.to_string(), true),
+    };
+
+    let input = local::SecretUpdateInput {
+        target_id,
+        name: args.name,
+        value: args.value,
+        generate,
+        note: args.note,
+        project: args.project,
+    };
+
+    match local::request_secret_update(&endpoint, &input).await {
+        Ok(outcome) => {
+            let result = json!({
+                "secretId": outcome.id,
+                "reference": outcome.reference,
+                "name": outcome.name,
+            });
+            (result.to_string(), false)
+        }
+        Err(e) => (map_local_error_to_tool_message(&e), true),
+    }
+}
+
+// ── delete_secret ────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteSecretArgs {
+    #[serde(default)]
+    secret_id: Option<String>,
+    #[serde(default)]
+    reference: Option<String>,
+}
+
+/// Run `delete_secret`. Returns `(text, isError)`; `text` is JSON-encoded
+/// `{deleted: true, secretId, name}` on success — the name of the deleted
+/// secret, never its value (which this op never touches).
+async fn run_delete_secret(arguments: Value, socket_override: &Option<String>) -> (String, bool) {
+    let args: DeleteSecretArgs = match serde_json::from_value(arguments) {
+        Ok(a) => a,
+        Err(e) => return (format!("Invalid arguments for delete_secret: {e}"), true),
+    };
+
+    let target_id = match resolve_one_of_id_or_reference(
+        args.secret_id,
+        args.reference,
+        local::strip_secret_reference,
+        "secretId",
+    ) {
+        Ok(id) => id,
+        Err(msg) => return (msg, true),
+    };
+
+    let endpoint = match resolve_endpoint(socket_override) {
+        Some(e) => e,
+        None => return (LOCAL_UNAVAILABLE_MSG.to_string(), true),
+    };
+
+    match local::request_secret_delete(&endpoint, &target_id).await {
+        Ok(outcome) => {
+            let result = json!({"deleted": true, "secretId": outcome.id, "name": outcome.name});
+            (result.to_string(), false)
+        }
+        Err(e) => (map_local_error_to_tool_message(&e), true),
+    }
+}
+
+// ── list_projects ────────────────────────────────────────────────────────
+
+/// Run `list_projects`. Returns `(text, isError)`; `text` is a JSON-encoded
+/// array of `{projectId, reference, name, write, organization}` on success.
+/// Takes no arguments (mirrors `describe_fill_target`'s signature).
+async fn run_list_projects(socket_override: &Option<String>) -> (String, bool) {
+    let endpoint = match resolve_endpoint(socket_override) {
+        Some(e) => e,
+        None => return (LOCAL_UNAVAILABLE_MSG.to_string(), true),
+    };
+
+    match local::request_project_list(&endpoint).await {
+        Ok(entries) => {
+            let result: Vec<Value> = entries
+                .iter()
+                .map(|entry| {
+                    let project_id = local::strip_project_reference(&entry.reference).to_string();
+                    json!({
+                        "projectId": project_id,
+                        "reference": entry.reference,
+                        "name": entry.name,
+                        "write": entry.write,
+                        "organization": entry.organization,
+                    })
+                })
+                .collect();
+            (Value::Array(result).to_string(), false)
+        }
+        Err(e) => (map_local_error_to_tool_message(&e), true),
+    }
+}
+
+// ── create_project ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CreateProjectArgs {
+    name: String,
+}
+
+/// Run `create_project`. Returns `(text, isError)`; `text` is JSON-encoded
+/// `{projectId, reference, name}` on success.
+async fn run_create_project(arguments: Value, socket_override: &Option<String>) -> (String, bool) {
+    let args: CreateProjectArgs = match serde_json::from_value(arguments) {
+        Ok(a) => a,
+        Err(e) => return (format!("Invalid arguments for create_project: {e}"), true),
+    };
+    if args.name.trim().is_empty() {
+        return ("The 'name' argument must not be empty.".to_string(), true);
+    }
+
+    let endpoint = match resolve_endpoint(socket_override) {
+        Some(e) => e,
+        None => return (LOCAL_UNAVAILABLE_MSG.to_string(), true),
+    };
+
+    match local::request_project_create(&endpoint, &args.name).await {
+        Ok(outcome) => {
+            let result = json!({
+                "projectId": outcome.id,
+                "reference": outcome.reference,
+                "name": outcome.name,
+            });
+            (result.to_string(), false)
+        }
+        Err(e) => (map_local_error_to_tool_message(&e), true),
+    }
+}
+
+// ── update_project ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateProjectArgs {
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    reference: Option<String>,
+    name: String,
+}
+
+/// Run `update_project`. Returns `(text, isError)`; `text` is JSON-encoded
+/// `{projectId, reference, name}` on success. Rename-only, per the
+/// architecture doc's M6 wire contract.
+async fn run_update_project(arguments: Value, socket_override: &Option<String>) -> (String, bool) {
+    let args: UpdateProjectArgs = match serde_json::from_value(arguments) {
+        Ok(a) => a,
+        Err(e) => return (format!("Invalid arguments for update_project: {e}"), true),
+    };
+    if args.name.trim().is_empty() {
+        return ("The 'name' argument must not be empty.".to_string(), true);
+    }
+
+    let target_id = match resolve_one_of_id_or_reference(
+        args.project_id,
+        args.reference,
+        local::strip_project_reference,
+        "projectId",
+    ) {
+        Ok(id) => id,
+        Err(msg) => return (msg, true),
+    };
+
+    let endpoint = match resolve_endpoint(socket_override) {
+        Some(e) => e,
+        None => return (LOCAL_UNAVAILABLE_MSG.to_string(), true),
+    };
+
+    match local::request_project_update(&endpoint, &target_id, &args.name).await {
+        Ok(outcome) => {
+            let result = json!({
+                "projectId": outcome.id,
+                "reference": outcome.reference,
+                "name": outcome.name,
+            });
+            (result.to_string(), false)
+        }
+        Err(e) => (map_local_error_to_tool_message(&e), true),
+    }
+}
+
+// ── delete_project ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteProjectArgs {
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    reference: Option<String>,
+}
+
+/// Run `delete_project`. Returns `(text, isError)`; `text` is JSON-encoded
+/// `{deleted: true, projectId, name}` on success. Permanent (hard delete):
+/// unlike `delete_secret`, there is no trash and no restore.
+async fn run_delete_project(arguments: Value, socket_override: &Option<String>) -> (String, bool) {
+    let args: DeleteProjectArgs = match serde_json::from_value(arguments) {
+        Ok(a) => a,
+        Err(e) => return (format!("Invalid arguments for delete_project: {e}"), true),
+    };
+
+    let target_id = match resolve_one_of_id_or_reference(
+        args.project_id,
+        args.reference,
+        local::strip_project_reference,
+        "projectId",
+    ) {
+        Ok(id) => id,
+        Err(msg) => return (msg, true),
+    };
+
+    let endpoint = match resolve_endpoint(socket_override) {
+        Some(e) => e,
+        None => return (LOCAL_UNAVAILABLE_MSG.to_string(), true),
+    };
+
+    match local::request_project_delete(&endpoint, &target_id).await {
+        Ok(outcome) => {
+            let result = json!({"deleted": true, "projectId": outcome.id, "name": outcome.name});
             (result.to_string(), false)
         }
         Err(e) => (map_local_error_to_tool_message(&e), true),
@@ -1950,13 +2633,20 @@ mod tests {
         .await
         .expect("tools/list replies");
         let tools = response["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 15);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"find_logins"));
         assert!(names.contains(&"run_with_credential"));
         assert!(names.contains(&"find_secrets"));
         assert!(names.contains(&"run_with_secret"));
         assert!(names.contains(&"create_secret"));
+        assert!(names.contains(&"generate_secret"));
+        assert!(names.contains(&"update_secret"));
+        assert!(names.contains(&"delete_secret"));
+        assert!(names.contains(&"list_projects"));
+        assert!(names.contains(&"create_project"));
+        assert!(names.contains(&"update_project"));
+        assert!(names.contains(&"delete_project"));
         assert!(names.contains(&"get_secret_findings"));
         assert!(names.contains(&"fill_credential"));
         assert!(names.contains(&"describe_fill_target"));
@@ -2053,6 +2743,124 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(required, vec!["name", "value"]);
+    }
+
+    // ── M6-A tool description/schema contract checks ────────────────────
+
+    async fn find_tool(name: &str) -> Value {
+        let response = handle_request(
+            request(Some(json!(2)), "tools/list", None),
+            &None,
+            &test_context(None),
+        )
+        .await
+        .expect("tools/list replies");
+        response["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} present"))
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn generate_secret_description_states_never_shown_and_cannot_be_retrieved() {
+        let tool = find_tool("generate_secret").await;
+        let desc = tool["description"].as_str().expect("description");
+        assert!(desc.contains("Bitwarden desktop"), "desc: {desc}");
+        assert!(
+            desc.contains("never shown to you") && desc.contains("cannot be retrieved"),
+            "generate_secret desc must state the value is never shown and cannot be retrieved: {desc}"
+        );
+        assert!(
+            desc.contains("run_with_secret"),
+            "generate_secret desc must mention run_with_secret: {desc}"
+        );
+        assert!(
+            desc.contains("encrypted"),
+            "generate_secret desc must mention encryption: {desc}"
+        );
+
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["name"]));
+        // No 'value' property at all — this tool can never be given one.
+        assert!(schema["properties"].get("value").is_none());
+        assert_eq!(schema["properties"]["length"]["minimum"], 12);
+        assert_eq!(schema["properties"]["length"]["maximum"], 128);
+    }
+
+    #[tokio::test]
+    async fn update_secret_description_states_rotation_recommendation() {
+        let tool = find_tool("update_secret").await;
+        let desc = tool["description"].as_str().expect("description");
+        assert!(desc.contains("Bitwarden desktop"), "desc: {desc}");
+        assert!(
+            desc.contains("generate: true"),
+            "update_secret desc must recommend generate: true for rotation: {desc}"
+        );
+        assert!(
+            desc.to_lowercase().contains("never exposes its value")
+                || desc.to_lowercase().contains("never expose"),
+            "update_secret desc must state renames/moves never expose the value: {desc}"
+        );
+
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema.get("required").is_none() || schema["required"] == json!([]));
+    }
+
+    #[tokio::test]
+    async fn delete_secret_description_states_trash_and_admin_restorable() {
+        let tool = find_tool("delete_secret").await;
+        let desc = tool["description"].as_str().expect("description");
+        assert!(desc.contains("Bitwarden desktop"), "desc: {desc}");
+        assert!(desc.contains("trash"), "desc: {desc}");
+        assert!(
+            desc.to_lowercase().contains("admin") && desc.to_lowercase().contains("restore"),
+            "delete_secret desc must state admin-restorable: {desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_projects_description_present() {
+        let tool = find_tool("list_projects").await;
+        let desc = tool["description"].as_str().expect("description");
+        assert!(desc.contains("Bitwarden desktop"), "desc: {desc}");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["properties"], json!({}));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[tokio::test]
+    async fn create_project_requires_name() {
+        let tool = find_tool("create_project").await;
+        let desc = tool["description"].as_str().expect("description");
+        assert!(desc.contains("Bitwarden desktop"), "desc: {desc}");
+        assert_eq!(tool["inputSchema"]["required"], json!(["name"]));
+    }
+
+    #[tokio::test]
+    async fn update_project_description_states_rename_only() {
+        let tool = find_tool("update_project").await;
+        let desc = tool["description"].as_str().expect("description");
+        assert!(desc.contains("Bitwarden desktop"), "desc: {desc}");
+        assert!(desc.to_lowercase().contains("rename"), "desc: {desc}");
+        assert_eq!(tool["inputSchema"]["required"], json!(["name"]));
+    }
+
+    #[tokio::test]
+    async fn delete_project_description_states_permanent_and_orphaning() {
+        let tool = find_tool("delete_project").await;
+        let desc = tool["description"].as_str().expect("description");
+        assert!(desc.contains("Bitwarden desktop"), "desc: {desc}");
+        assert!(desc.contains("permanent"), "desc: {desc}");
+        assert!(
+            desc.to_lowercase().contains("not deleted")
+                && desc.to_lowercase().contains("inaccessible"),
+            "delete_project desc must state secrets survive but may become inaccessible: {desc}"
+        );
     }
 
     #[tokio::test]
@@ -2950,6 +3758,588 @@ mod unix_integration_tests {
             .expect("text content");
         assert!(!text.contains(&path), "raw socket path leaked");
         assert!(!text.contains("hunter2"), "value leaked");
+    }
+
+    // ── generate_secret ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn generate_secret_happy_path_returns_secret_id_reference_and_name() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://secret/secret-1","item":{"name":"DB_PASSWORD"}}"#,
+        )
+        .await;
+
+        let response = call_tool(
+            Some(socket),
+            "generate_secret",
+            json!({"name": "DB_PASSWORD", "length": 24, "symbols": false, "project": "my-app"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let result: Value = serde_json::from_str(text).expect("valid json");
+        assert_eq!(result["secretId"], "secret-1");
+        assert_eq!(result["reference"], "bw://secret/secret-1");
+        assert_eq!(result["name"], "DB_PASSWORD");
+    }
+
+    #[tokio::test]
+    async fn generate_secret_rejects_out_of_range_length_before_dispatch() {
+        // No mock server: an out-of-range length must be rejected before any
+        // connection is attempted.
+        let response = call_tool(
+            Some("/nonexistent".to_string()),
+            "generate_secret",
+            json!({"name": "DB_PASSWORD", "length": 200}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("12") && text.contains("128"), "text: {text}");
+    }
+
+    #[tokio::test]
+    async fn generate_secret_requires_non_empty_name() {
+        let response = call_tool(
+            Some("/nonexistent".to_string()),
+            "generate_secret",
+            json!({"name": ""}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("'name'"));
+    }
+
+    #[tokio::test]
+    async fn generate_secret_connect_failed_does_not_leak_socket_path() {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+
+        let response = call_tool(
+            Some(path.clone()),
+            "generate_secret",
+            json!({"name": "DB_PASSWORD"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(!text.contains(&path), "raw socket path leaked");
+    }
+
+    // ── update_secret ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_secret_happy_path_returns_secret_id_reference_and_name() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://secret/secret-1","item":{"name":"NEW_NAME"}}"#,
+        )
+        .await;
+
+        let response = call_tool(
+            Some(socket),
+            "update_secret",
+            json!({"secretId": "secret-1", "name": "NEW_NAME"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let result: Value = serde_json::from_str(text).expect("valid json");
+        assert_eq!(result["secretId"], "secret-1");
+        assert_eq!(result["reference"], "bw://secret/secret-1");
+        assert_eq!(result["name"], "NEW_NAME");
+    }
+
+    #[tokio::test]
+    async fn update_secret_generate_true_happy_path() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://secret/secret-1","item":{"name":"DB_PASSWORD"}}"#,
+        )
+        .await;
+
+        let response = call_tool(
+            Some(socket),
+            "update_secret",
+            json!({"secretId": "secret-1", "generate": true, "length": 32}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], false);
+    }
+
+    /// Mirrors `create_secret_value_never_in_output_on_every_status`: the
+    /// submitted (or generated) value must never appear in the tool result,
+    /// no matter what status the mock server replies with — including a
+    /// server bug that returns a value-bearing `secret` object.
+    #[tokio::test]
+    async fn update_secret_value_never_in_output_on_every_status() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "denied",
+                r#"{"version":1,"status":"denied","message":"Denied by user"}"#,
+            ),
+            (
+                "locked",
+                r#"{"version":1,"status":"locked","message":"Vault is locked"}"#,
+            ),
+            (
+                "error",
+                r#"{"version":1,"status":"error","message":"boom"}"#,
+            ),
+            (
+                "missing-reference",
+                r#"{"version":1,"status":"approved","item":{"name":"DB_PASSWORD"}}"#,
+            ),
+            (
+                "value-bearing-reply",
+                r#"{"version":1,"status":"approved","secret":{"name":"DB_PASSWORD","value":"hunter2-super-secret","secretId":"secret-1"},"reference":"bw://secret/secret-1"}"#,
+            ),
+        ];
+
+        for (label, response_line) in cases {
+            let socket = spawn_mock_server(response_line).await;
+            let response = call_tool(
+                Some(socket),
+                "update_secret",
+                json!({"secretId": "secret-1", "value": "hunter2-super-secret"}),
+            )
+            .await;
+
+            assert_eq!(
+                response["result"]["isError"], true,
+                "case {label} should be isError"
+            );
+            let text = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text content");
+            assert!(
+                !text.contains("hunter2-super-secret"),
+                "case {label}: value leaked in tool text: {text}"
+            );
+            assert!(
+                !response.to_string().contains("hunter2-super-secret"),
+                "case {label}: value leaked anywhere in response: {response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_secret_requires_exactly_one_of_secret_id_or_reference() {
+        let response = call_tool(
+            Some("/nonexistent".to_string()),
+            "update_secret",
+            json!({"name": "NEW_NAME"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("exactly one"));
+    }
+
+    #[tokio::test]
+    async fn update_secret_rejects_value_and_generate_together() {
+        let response = call_tool(
+            Some("/nonexistent".to_string()),
+            "update_secret",
+            json!({"secretId": "secret-1", "value": "x", "generate": true}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("at most one"), "text: {text}");
+    }
+
+    #[tokio::test]
+    async fn update_secret_requires_at_least_one_change_field() {
+        let response = call_tool(
+            Some("/nonexistent".to_string()),
+            "update_secret",
+            json!({"secretId": "secret-1"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("at least one change"), "text: {text}");
+    }
+
+    #[tokio::test]
+    async fn update_secret_rejects_out_of_range_length_before_dispatch() {
+        let response = call_tool(
+            Some("/nonexistent".to_string()),
+            "update_secret",
+            json!({"secretId": "secret-1", "generate": true, "length": 5}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("12") && text.contains("128"), "text: {text}");
+    }
+
+    #[tokio::test]
+    async fn update_secret_accepts_reference_and_strips_prefix() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://secret/secret-1","item":{"name":"NEW_NAME"}}"#,
+        )
+        .await;
+
+        let response = call_tool(
+            Some(socket),
+            "update_secret",
+            json!({"reference": "bw://secret/secret-1", "name": "NEW_NAME"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn update_secret_connect_failed_does_not_leak_socket_path() {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+
+        let response = call_tool(
+            Some(path.clone()),
+            "update_secret",
+            json!({"secretId": "secret-1", "name": "NEW_NAME"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(!text.contains(&path), "raw socket path leaked");
+    }
+
+    // ── delete_secret ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_secret_happy_path() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://secret/secret-1","item":{"name":"DB_PASSWORD"}}"#,
+        )
+        .await;
+
+        let response = call_tool(
+            Some(socket),
+            "delete_secret",
+            json!({"secretId": "secret-1"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let result: Value = serde_json::from_str(text).expect("valid json");
+        assert_eq!(result["deleted"], true);
+        assert_eq!(result["secretId"], "secret-1");
+        assert_eq!(result["name"], "DB_PASSWORD");
+    }
+
+    #[tokio::test]
+    async fn delete_secret_requires_exactly_one_of_secret_id_or_reference() {
+        let response = call_tool(
+            Some("/nonexistent".to_string()),
+            "delete_secret",
+            json!({"secretId": "secret-1", "reference": "bw://secret/secret-1"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("not both"));
+    }
+
+    #[tokio::test]
+    async fn delete_secret_connect_failed_does_not_leak_socket_path() {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+
+        let response = call_tool(
+            Some(path.clone()),
+            "delete_secret",
+            json!({"secretId": "secret-1"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(!text.contains(&path), "raw socket path leaked");
+    }
+
+    // ── list_projects ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_projects_happy_path_multi_entry() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","projects":[{"name":"my-app","reference":"bw://project/p-1","write":true,"organization":"Acme"},{"name":"infra","reference":"bw://project/p-2","write":false,"organization":"Acme"}]}"#,
+        )
+        .await;
+
+        let response = call_tool(Some(socket), "list_projects", json!({})).await;
+
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let entries: Value = serde_json::from_str(text).expect("valid json list");
+        assert_eq!(entries.as_array().expect("array").len(), 2);
+        assert_eq!(entries[0]["projectId"], "p-1");
+        assert_eq!(entries[0]["name"], "my-app");
+        assert_eq!(entries[0]["write"], true);
+        assert_eq!(entries[0]["organization"], "Acme");
+        assert_eq!(entries[1]["projectId"], "p-2");
+        assert_eq!(entries[1]["write"], false);
+    }
+
+    #[tokio::test]
+    async fn list_projects_denied_maps_to_is_error_tool_result() {
+        let socket =
+            spawn_mock_server(r#"{"version":1,"status":"denied","message":"Denied by user"}"#)
+                .await;
+
+        let response = call_tool(Some(socket), "list_projects", json!({})).await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.to_lowercase().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn list_projects_connect_failed_does_not_leak_socket_path() {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+
+        let response = call_tool(Some(path.clone()), "list_projects", json!({})).await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(!text.contains(&path), "raw socket path leaked");
+    }
+
+    // ── create_project / update_project / delete_project ────────────────
+
+    #[tokio::test]
+    async fn create_project_happy_path() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"my-app"}}"#,
+        )
+        .await;
+
+        let response = call_tool(Some(socket), "create_project", json!({"name": "my-app"})).await;
+
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let result: Value = serde_json::from_str(text).expect("valid json");
+        assert_eq!(result["projectId"], "project-1");
+        assert_eq!(result["reference"], "bw://project/project-1");
+        assert_eq!(result["name"], "my-app");
+    }
+
+    #[tokio::test]
+    async fn create_project_requires_non_empty_name() {
+        let response = call_tool(
+            Some("/nonexistent".to_string()),
+            "create_project",
+            json!({"name": ""}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("'name'"));
+    }
+
+    #[tokio::test]
+    async fn create_project_connect_failed_does_not_leak_socket_path() {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+
+        let response = call_tool(
+            Some(path.clone()),
+            "create_project",
+            json!({"name": "my-app"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(!text.contains(&path), "raw socket path leaked");
+    }
+
+    #[tokio::test]
+    async fn update_project_happy_path() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"Renamed"}}"#,
+        )
+        .await;
+
+        let response = call_tool(
+            Some(socket),
+            "update_project",
+            json!({"projectId": "project-1", "name": "Renamed"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let result: Value = serde_json::from_str(text).expect("valid json");
+        assert_eq!(result["projectId"], "project-1");
+        assert_eq!(result["name"], "Renamed");
+    }
+
+    #[tokio::test]
+    async fn update_project_requires_exactly_one_of_project_id_or_reference() {
+        let response = call_tool(
+            Some("/nonexistent".to_string()),
+            "update_project",
+            json!({"name": "Renamed"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("exactly one"));
+    }
+
+    #[tokio::test]
+    async fn update_project_missing_arguments_is_invalid_arguments_error() {
+        let response = call_tool(
+            Some("/nonexistent".to_string()),
+            "update_project",
+            json!({"projectId": "project-1"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("Invalid arguments"));
+    }
+
+    #[tokio::test]
+    async fn update_project_connect_failed_does_not_leak_socket_path() {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+
+        let response = call_tool(
+            Some(path.clone()),
+            "update_project",
+            json!({"projectId": "project-1", "name": "Renamed"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(!text.contains(&path), "raw socket path leaked");
+    }
+
+    #[tokio::test]
+    async fn delete_project_happy_path() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"my-app"}}"#,
+        )
+        .await;
+
+        let response = call_tool(
+            Some(socket),
+            "delete_project",
+            json!({"projectId": "project-1"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let result: Value = serde_json::from_str(text).expect("valid json");
+        assert_eq!(result["deleted"], true);
+        assert_eq!(result["projectId"], "project-1");
+        assert_eq!(result["name"], "my-app");
+    }
+
+    #[tokio::test]
+    async fn delete_project_requires_exactly_one_of_project_id_or_reference() {
+        let response = call_tool(
+            Some("/nonexistent".to_string()),
+            "delete_project",
+            json!({}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("exactly one"));
+    }
+
+    #[tokio::test]
+    async fn delete_project_connect_failed_does_not_leak_socket_path() {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+
+        let response = call_tool(
+            Some(path.clone()),
+            "delete_project",
+            json!({"projectId": "project-1"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(!text.contains(&path), "raw socket path leaked");
     }
 
     #[tokio::test]
