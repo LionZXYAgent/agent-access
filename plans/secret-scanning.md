@@ -7,6 +7,22 @@
 > below are updated in place; the original §1 argued the engine into this workspace for iteration
 > speed, which is a convenience argument, not an architectural one.
 
+> **Amendment 2 (2026-08-12, Max).** Scanning must be available from the MCP server without a manual
+> `bws scan` first, and without installing `bws` separately — the desktop-bundled `aac` must be
+> self-contained. `aac mcp` gains a `scan_secrets` tool that runs the `bitwarden-scan` engine
+> **in-process** (worktree mode, writes the artifact via the engine's own `write_artifact`, then
+> serves it through the same envelope as `get_secret_findings`). The engine's single home remains
+> `sdk-sm`: `ap-cli` consumes it as a crate dependency (sibling-checkout path dep, pin to a git rev
+> before merging) — this repo still carries no detection rules or scanning logic of its own, and the
+> engine crate has no Secrets Manager API surface, so linking it does not widen what the bundled
+> binary can reach (~1 MB size cost; a subprocess-`bws` alternative was built first and rejected —
+> it required a 20 MB second binary or a separate install). `findings_artifact.rs` stays as the
+> tolerant reader for artifacts written by a NEWER external `bws` than the pinned engine.
+> The original "the agent never runs the scan" property is superseded for invocation — determinism,
+> auditability, and identical-results-for-identical-input still hold because the scan itself is the
+> same non-agentic engine; only the trigger moved. No approval prompt: the scan reads only the repo
+> the agent can already read, and touches no vault data.
+
 **Goal:** Detect hardcoded secrets in a codebase (working tree, staged changes, and git history) with a
 deterministic, non-agentic scanner, and serve the results to MCP clients as read-only data. Remediation
 loops back through the existing `create_secret` tool, which already carries its own desktop approval.
@@ -17,8 +33,9 @@ willingness to report faithfully; precomputing makes results deterministic, audi
 the same input.
 
 **Scope:** detection engine and producer CLI (`bws scan`) in `sdk-sm`; the findings artifact as the
-cross-repo contract; read-only MCP serving via the `resources` primitive in
-`crates/ap-cli/src/command/mcp.rs`. There is deliberately **no `aac scan`** — `aac` never scans.
+cross-repo contract; MCP serving (read via `resources` + `get_secret_findings`, scanning via
+`scan_secrets`) in `crates/ap-cli/src/command/mcp.rs`. There is deliberately **no `aac scan` CLI
+subcommand** — humans use `bws scan`; only the MCP surface scans here (amendment 2).
 
 **Out of scope:** live validation of found credentials against provider APIs (trufflehog-style);
 git-history rewriting; automated remediation beyond the existing `create_secret` flow; any desktop UI for
@@ -38,7 +55,7 @@ across repos so the thing that ships in the desktop app is not the thing that ca
 |-------|-------|----------------|
 | Engine | `sdk-sm` → `crates/bitwarden-scan` | Detectors, walkers, finding model, baseline. No SM-API/vault dependency. |
 | Producer | `bws scan` (`sdk-sm`) | Runs the engine, writes the findings artifact. Worktree, staged, and history modes. |
-| Server | `aac mcp` (this repo) | Reads the artifact from disk, exposes it as one MCP resource + one read-only tool. Never scans. |
+| Server | `aac mcp` (this repo) | Reads the artifact from disk, exposes it as one MCP resource + one read-only tool (`get_secret_findings`) + one scan tool (`scan_secrets`, which runs the `bitwarden-scan` engine in-process). Depends on the engine crate; defines no rules or detection logic of its own. |
 
 The engine is a sibling crate in the `sdk-sm` workspace, **not** part of the `bitwarden` API-client
 crate (which the napi/py/wasm wrappers consume — none of them need a regex engine). `aac` does not

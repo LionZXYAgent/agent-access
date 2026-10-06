@@ -173,18 +173,17 @@ async fn build_context(repo_override: Option<PathBuf>) -> McpContext {
     }
 }
 
-/// Told to the agent when `status` is `no_repo` or `never_scanned`: this
-/// server never scans, so findings only ever come from running `bws scan`
-/// (the Bitwarden Secrets Manager CLI) out of band.
+/// Told to the agent when `status` is `no_repo` or `never_scanned`: reading
+/// findings never triggers a scan; a fresh scan comes from the
+/// `scan_secrets` tool (or `bws scan` out of band).
 const NO_REPO_HINT: &str = "No git repository was resolved for this MCP server (no --repo flag \
     was given, and `git rev-parse --show-toplevel` did not resolve one from the server's working \
-    directory), so no findings artifact can be located. This server never scans on its own: run \
-    `bws scan` (the Bitwarden Secrets Manager CLI) inside the target repository to produce \
-    .bitwarden/secret-findings.json, then point this server at it with --repo.";
+    directory), so no findings artifact can be located and no scan can be run. Point this server \
+    at the target repository with --repo (or launch it from inside one), then call scan_secrets.";
 
 const NEVER_SCANNED_HINT: &str = "No findings artifact has been produced for this repository \
-    yet. This server never scans on its own: run `bws scan` (the Bitwarden Secrets Manager CLI) \
-    in the repo to produce .bitwarden/secret-findings.json.";
+    yet. Call the scan_secrets tool to run a scan now, or run `bws scan` (the Bitwarden Secrets \
+    Manager CLI) in the repo out of band — either produces .bitwarden/secret-findings.json.";
 
 /// The `{status, repo_root, report, remediation, ...}` envelope served by
 /// both `resources/read` and the `get_secret_findings` tool (plan §3).
@@ -486,13 +485,17 @@ that buys nothing — and unlike `fill_credential`, `find_logins` does release v
 item name and username). Look a login up first only when you genuinely need to show the user what \
 matched, or to disambiguate between several accounts on one site.
 
-To remove a hardcoded credential or secret from source code: find the literal, then store it with \
+To remove hardcoded credentials or secrets from source code: call scan_secrets to locate them \
+(a local, deterministic scan — no approval prompt, nothing leaves the machine; get_secret_findings \
+rereads the last scan's results without scanning), then store each with \
 create_secret (you already know the value) or generate_secret (Bitwarden generates it inside the \
 desktop app — you never see it), optionally into a project from list_projects/create_project. \
 Replace the literal in code with the returned reference or UUID and wire up the Bitwarden Secrets \
 Manager SDK — or use run_with_secret to inject the real value at runtime without ever seeing it \
 yourself. To rotate an existing secret, call update_secret with generate: true instead of supplying \
-'value' yourself, so the new value is generated and stored without ever passing through you.";
+'value' yourself, so the new value is generated and stored without ever passing through you. When a \
+service consumes a whole project's worth of secrets at runtime, prefer run_with_project_secrets over \
+one run_with_secret call per secret — one approval injects the project's full set instead of many.";
 
 fn initialize_result() -> Value {
     json!({
@@ -523,6 +526,8 @@ fn tools_list_result() -> Value {
         create_project_tool_def(),
         update_project_tool_def(),
         delete_project_tool_def(),
+        run_with_project_secrets_tool_def(),
+        scan_secrets_tool_def(),
         get_secret_findings_tool_def(),
         fill_credential_tool_def(),
         describe_fill_target_tool_def(),
@@ -537,10 +542,10 @@ fn resource_def() -> Value {
         "name": "Secret scan findings",
         "mimeType": "application/json",
         "description": "Precomputed, deterministic secret-scan findings for this repository, \
-            produced out of band by `bws scan` (the Bitwarden Secrets Manager CLI) and read \
-            fresh from disk on every read of this resource — this server contains no scanner \
-            and reading it never triggers a scan. Never contains a secret value: only file \
-            locations, rule ids, and masked previews.",
+            produced by the scan_secrets tool (or `bws scan`, the Bitwarden Secrets Manager \
+            CLI, out of band) and read fresh from disk on every read of this resource — \
+            reading it never triggers a scan; call scan_secrets to refresh it. Never contains \
+            a secret value: only file locations, rule ids, and masked previews.",
     })
 }
 
@@ -999,23 +1004,103 @@ fn delete_project_tool_def() -> Value {
     })
 }
 
+// ── M7-A: run_with_project_secrets (`bws run` parity) ────────────────────
+
+fn run_with_project_secrets_tool_def() -> Value {
+    json!({
+        "name": "run_with_project_secrets",
+        "description": "Run a local command with every secret in a Bitwarden Secrets Manager \
+            project injected into its environment — one approval releases a whole project's \
+            secrets instead of one run_with_secret call (and one approval) per secret. Requires \
+            the user to approve this request in the Bitwarden desktop app, which must be open \
+            and unlocked — the call fails if it isn't; the user sees the full list of secret \
+            names in the project before approving. No secret value is ever returned to you: \
+            each is injected only into the child process's environment and scrubbed from the \
+            command's captured stdout/stderr before being returned — though, as with \
+            run_with_secret, a child process that re-encodes a value (base64, a different \
+            format, ...) before printing it can defeat scrubbing, so the values are injected \
+            into the command's environment, not made invisible to it. Prefer this over N \
+            run_with_secret calls whenever a command needs a whole project's secrets.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Project name, UUID, or bw://project/<id> reference \
+                        identifying the project whose secrets to inject. Unlike run_with_secret, \
+                        a project is always required — there is no whole-organization form.",
+                },
+                "command": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "Command and arguments to execute. Secrets are injected into \
+                        this process's environment, not passed as arguments.",
+                },
+                "uuidsAsKeynames": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Name each secret's environment variable after its UUID (a \
+                        POSIX-safe '_'-prefixed form) instead of its own name. Use this when two \
+                        or more secret names in the project would otherwise collide as \
+                        environment variable names — a collision without this flag set fails \
+                        the call before the command runs.",
+                },
+            },
+            "required": ["project", "command"],
+            "additionalProperties": false,
+        },
+    })
+}
+
+/// Run the scanner. The engine lives in `sdk-sm` (`bitwarden-scan`, the
+/// crate behind `bws scan`) and is linked in-process here so the bundled
+/// desktop binary is self-contained — sdk-sm remains the engine's single
+/// home; this repo carries no detection rules of its own. Description
+/// states what an agent must know to call it correctly: local-only,
+/// deterministic, no approval prompt, worktree mode, masked previews, same
+/// envelope as get_secret_findings.
+fn scan_secrets_tool_def() -> Value {
+    json!({
+        "name": "scan_secrets",
+        "description": "Scan this repository's working tree for hardcoded secrets and return \
+            the findings. Runs the Bitwarden Secrets Manager scanning engine (the same \
+            deterministic, rule-based scanner behind `bws scan` — regex/entropy detectors, no \
+            AI and no guessing) locally, in-process: nothing is uploaded, no vault data is \
+            touched, and no approval prompt is shown. Refreshes the \
+            on-disk findings artifact (.bitwarden/secret-findings.json) and returns the same \
+            envelope as get_secret_findings, so no follow-up read is needed. Finding previews \
+            are masked — the actual secret value is never included; read the file at the \
+            finding's path:line if you need the literal. For a worktree finding, migrate it \
+            with create_secret or generate_secret and replace the literal with a \
+            bw://secret/<id> reference injected via run_with_secret. For a history finding, \
+            the secret is already distributed to every clone of the repository, so the correct \
+            action is to rotate it at the provider — do not attempt to rewrite git history.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        },
+    })
+}
+
 /// Compatibility path for MCP clients that don't surface resources (plan
 /// §3). Description deliberately spells out every property an agent needs
 /// to act correctly on a finding without the model having to infer it: the
-/// scan is precomputed/deterministic/non-AI and runs elsewhere (`bws
-/// scan`), this tool never runs one, provenance must be checked for
-/// staleness, values are never included, and the two remediation paths
-/// differ (migrate vs. rotate).
+/// scan is precomputed/deterministic/non-AI, this tool never runs one
+/// (that's scan_secrets' job), provenance must be checked for staleness,
+/// values are never included, and the two remediation paths differ
+/// (migrate vs. rotate).
 fn get_secret_findings_tool_def() -> Value {
     json!({
         "name": "get_secret_findings",
         "description": "Return precomputed secret-scan findings for this repository, read \
             fresh from the on-disk findings artifact on every call. Findings come from a \
-            deterministic, rule-based scan — regex/entropy detectors, no AI and no guessing — \
-            run out of band by `bws scan` (the Bitwarden Secrets Manager CLI); this server \
-            contains no scanner, and this tool never triggers a scan itself, so calling it \
-            repeatedly will not produce fresher results unless `bws scan` has run again in the \
-            meantime. Every response carries provenance (generated_at, head_commit, dirty) that \
+            deterministic, rule-based scan — regex/entropy detectors, no AI and no guessing. \
+            This tool never triggers a scan itself: calling it repeatedly will not produce \
+            fresher results unless a scan has run again in the meantime — call scan_secrets \
+            to run one now, or run `bws scan` (the Bitwarden Secrets Manager CLI) out of \
+            band. Every response carries provenance (generated_at, head_commit, dirty) that \
             you MUST check against the current repo state for staleness before acting on a \
             finding — the file may have already been fixed since the scan ran. Finding previews \
             are masked: the actual secret value is never included here, so read the file at the \
@@ -1137,6 +1222,10 @@ async fn handle_tools_call(
         "create_project" => run_create_project(arguments, socket_override).await,
         "update_project" => run_update_project(arguments, socket_override).await,
         "delete_project" => run_delete_project(arguments, socket_override).await,
+        "run_with_project_secrets" => {
+            run_with_project_secrets_tool(arguments, socket_override).await
+        }
+        "scan_secrets" => run_scan_secrets(context).await,
         "get_secret_findings" => run_get_secret_findings(context),
         "fill_credential" => run_fill_credential(arguments, socket_override).await,
         "describe_fill_target" => run_describe_fill_target(socket_override).await,
@@ -1144,6 +1233,51 @@ async fn handle_tools_call(
     };
 
     Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
+}
+
+// ── scan_secrets ────────────────────────────────────────────────────────
+
+/// Run `scan_secrets`: run the `bitwarden-scan` engine (sdk-sm — the same
+/// engine behind `bws scan`) in-process over the resolved repo root, write
+/// the findings artifact, and serve it via [`build_envelope`]. Worktree
+/// mode only: it's the mode that writes the artifact, and the one the
+/// remediation workflow needs. In-process rather than a `bws` subprocess so
+/// the desktop-bundled `aac` is self-contained — the engine crate carries no
+/// Secrets Manager API surface, so linking it does not widen what this
+/// binary can reach. The scan is synchronous filesystem work, so it runs on
+/// a blocking thread; a scan error is a tool error whose text comes from
+/// [`bitwarden_scan::ScanError`], which never carries a matched value.
+async fn run_scan_secrets(context: &SharedContext) -> (String, bool) {
+    let Some(repo_root) = context.repo_root.as_deref() else {
+        return (
+            "No git repository was resolved for this MCP server, so there is nothing to \
+             scan. Point the server at the target repository with --repo (or launch it from \
+             inside one) and try again."
+                .to_string(),
+            true,
+        );
+    };
+
+    let scan_root = repo_root.to_path_buf();
+    let scanned = tokio::task::spawn_blocking(move || {
+        let opts = bitwarden_scan::ScanOptions::new(&scan_root);
+        let report = bitwarden_scan::scan_worktree(&opts)?;
+        // Write to the root the engine resolved (bws parity) so the
+        // artifact lands where every reader — including this server's own
+        // build_envelope — expects it.
+        bitwarden_scan::write_artifact(Path::new(&report.repo_root), &report)?;
+        Ok::<_, bitwarden_scan::ScanError>(())
+    })
+    .await;
+
+    match scanned {
+        Ok(Ok(())) => {
+            let envelope = build_envelope(Some(repo_root));
+            (envelope.to_string(), false)
+        }
+        Ok(Err(e)) => (format!("The scan failed: {e}"), true),
+        Err(e) => (format!("The scan task failed to complete: {e}"), true),
+    }
 }
 
 // ── get_secret_findings ─────────────────────────────────────────────────
@@ -2012,6 +2146,118 @@ async fn run_delete_project(arguments: Value, socket_override: &Option<String>) 
     }
 }
 
+// ── M7-A: run_with_project_secrets (`bws run` parity) ────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunWithProjectSecretsArgs {
+    project: String,
+    command: Vec<String>,
+    #[serde(default)]
+    uuids_as_keynames: bool,
+}
+
+/// Run `run_with_project_secrets`. Returns `(text, isError)`; `text` is
+/// JSON-encoded `{exitCode, output: {stdout, stderr}, injected: [names]}` on
+/// success. Mirrors `run_with_secret_tool`'s shape, generalized to a
+/// project's whole secret set: every secret's value is injected into the
+/// child's environment and scrubbed from its captured output, and `injected`
+/// lists env var *names* only — no value is ever placed in `text` or in any
+/// error message, on any code path (architecture doc, M7).
+async fn run_with_project_secrets_tool(
+    arguments: Value,
+    socket_override: &Option<String>,
+) -> (String, bool) {
+    let args: RunWithProjectSecretsArgs = match serde_json::from_value(arguments) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                format!("Invalid arguments for run_with_project_secrets: {e}"),
+                true,
+            );
+        }
+    };
+
+    if args.project.trim().is_empty() {
+        return (
+            "The 'project' argument must not be empty.".to_string(),
+            true,
+        );
+    }
+    if args.command.is_empty() {
+        return (
+            "The 'command' argument must be a non-empty array.".to_string(),
+            true,
+        );
+    }
+
+    let query = local::project_query_from_flag(&args.project);
+
+    let endpoint = match resolve_endpoint(socket_override) {
+        Some(e) => e,
+        None => return (LOCAL_UNAVAILABLE_MSG.to_string(), true),
+    };
+
+    let outcome = match local::request_project_secrets(&endpoint, &query).await {
+        Ok(outcome) => outcome,
+        Err(e) => return (map_local_error_to_tool_message(&e), true),
+    };
+    // Value-free: project name/reference only, routed to stderr per this
+    // module's tracing setup — never the secret values themselves.
+    tracing::debug!(
+        project = %outcome.project_name,
+        reference = %outcome.reference,
+        secret_count = outcome.secrets.len(),
+        "run_with_project_secrets: released project"
+    );
+
+    let env_pairs =
+        match local::resolve_project_secrets_env_names(&outcome.secrets, args.uuids_as_keynames) {
+            Ok(pairs) => pairs,
+            Err(collisions) => {
+                // Never spawn the child on a naming collision — and never
+                // name anything but the colliding env var name(s).
+                return (
+                    format!(
+                        "Refusing to run: secrets in project '{}' collide on environment \
+                         variable name(s): {}. Pass uuidsAsKeynames: true to avoid this, or \
+                         rename the conflicting secrets.",
+                        outcome.project_name,
+                        collisions.join(", ")
+                    ),
+                    true,
+                );
+            }
+        };
+
+    let mut env_vars = HashMap::new();
+    let mut secret_values = Vec::new();
+    let mut injected = Vec::new();
+    for (env_name, value) in &env_pairs {
+        let value = value.as_str().to_string();
+        env_vars.insert(env_name.clone(), value.clone());
+        if !value.is_empty() {
+            secret_values.push(value);
+        }
+        injected.push(env_name.clone());
+    }
+
+    let program = args.command[0].clone();
+    let child_args = &args.command[1..];
+
+    match run_child_captured(&program, child_args, &env_vars, secret_values).await {
+        Ok((exit_code, stdout, stderr)) => {
+            let result = json!({
+                "exitCode": exit_code,
+                "output": {"stdout": stdout, "stderr": stderr},
+                "injected": injected,
+            });
+            (result.to_string(), false)
+        }
+        Err(e) => (format!("Failed to run command '{program}': {e}"), true),
+    }
+}
+
 // ── fill_credential / describe_fill_target ──────────────────────────────
 
 // No `rename_all`: every field name here matches its inputSchema property
@@ -2633,7 +2879,7 @@ mod tests {
         .await
         .expect("tools/list replies");
         let tools = response["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 17);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"find_logins"));
         assert!(names.contains(&"run_with_credential"));
@@ -2647,18 +2893,20 @@ mod tests {
         assert!(names.contains(&"create_project"));
         assert!(names.contains(&"update_project"));
         assert!(names.contains(&"delete_project"));
+        assert!(names.contains(&"run_with_project_secrets"));
+        assert!(names.contains(&"scan_secrets"));
         assert!(names.contains(&"get_secret_findings"));
         assert!(names.contains(&"fill_credential"));
         assert!(names.contains(&"describe_fill_target"));
         for tool in tools {
             assert_eq!(tool["inputSchema"]["type"], "object");
         }
-        // `get_secret_findings` and `describe_fill_target` don't gate on
-        // desktop approval — every *other* tool does.
+        // `scan_secrets`, `get_secret_findings`, and `describe_fill_target`
+        // don't gate on desktop approval — every *other* tool does.
         for tool in tools.iter().filter(|t| {
             !matches!(
                 t["name"].as_str(),
-                Some("get_secret_findings" | "describe_fill_target")
+                Some("scan_secrets" | "get_secret_findings" | "describe_fill_target")
             )
         }) {
             assert!(
@@ -2864,6 +3112,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_with_project_secrets_description_and_schema_contract() {
+        let tool = find_tool("run_with_project_secrets").await;
+        let desc = tool["description"].as_str().expect("description");
+        assert!(desc.contains("Bitwarden desktop"), "desc: {desc}");
+        assert!(desc.contains("approve"), "desc: {desc}");
+        assert!(
+            desc.to_lowercase().contains("full list of secret names"),
+            "run_with_project_secrets desc must state the user sees every secret name before \
+             approving: {desc}"
+        );
+        assert!(
+            desc.contains("No secret value is ever returned to you"),
+            "run_with_project_secrets desc must state values are never returned: {desc}"
+        );
+        assert!(
+            desc.contains("run_with_secret"),
+            "run_with_project_secrets desc must compare itself to run_with_secret: {desc}"
+        );
+
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, vec!["project", "command"]);
+        assert!(schema["properties"]["uuidsAsKeynames"].is_object());
+    }
+
+    #[tokio::test]
     async fn ping_returns_empty_result() {
         let response = handle_request(
             request(Some(json!(9)), "ping", None),
@@ -2980,8 +3261,8 @@ mod tests {
         assert!(
             envelope["hint"]
                 .as_str()
-                .is_some_and(|h| h.contains("bws scan")),
-            "no_repo envelope must hint at running bws scan: {envelope}"
+                .is_some_and(|h| h.contains("--repo") && h.contains("scan_secrets")),
+            "no_repo envelope must hint at --repo and scan_secrets: {envelope}"
         );
     }
 
@@ -3231,6 +3512,148 @@ mod tests {
         assert_eq!(
             envelope["report"]["findings"][0]["rule_id"],
             "aws-access-key-id"
+        );
+    }
+
+    // ── scan_secrets ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn scan_secrets_def_states_local_no_approval_and_masked() {
+        let response = handle_request(
+            request(Some(json!(2)), "tools/list", None),
+            &None,
+            &test_context(None),
+        )
+        .await
+        .expect("tools/list replies");
+        let tools = response["result"]["tools"].as_array().expect("tools array");
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "scan_secrets")
+            .expect("scan_secrets present");
+
+        let desc = tool["description"].as_str().expect("description");
+        assert!(desc.contains("nothing is uploaded"), "desc: {desc}");
+        assert!(desc.contains("no approval prompt"), "desc: {desc}");
+        assert!(desc.contains("masked"), "desc: {desc}");
+        assert!(desc.contains("bws"), "desc must name the scanner: {desc}");
+
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(
+            schema["properties"]
+                .as_object()
+                .expect("properties")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_secrets_errors_when_repo_unresolved() {
+        let response = handle_request(
+            request(
+                Some(json!(30)),
+                "tools/call",
+                Some(json!({"name": "scan_secrets", "arguments": {}})),
+            ),
+            &None,
+            &test_context(None),
+        )
+        .await
+        .expect("tools/call replies");
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(
+            text.contains("--repo"),
+            "message must be actionable: {text}"
+        );
+    }
+
+    /// A canonical AWS access-key-id test value, assembled so this source
+    /// file doesn't itself trip secret scanners.
+    fn planted_aws_key() -> String {
+        format!("AKIA{}", "IOSFODNN7EXAMPLE")
+    }
+
+    #[tokio::test]
+    async fn scan_secrets_finds_a_planted_secret_and_writes_the_artifact() {
+        let repo = TestRepoDir::new("scan-in-process");
+        std::fs::write(
+            repo.path().join("config.py"),
+            format!("AWS_KEY = \"{}\"\n", planted_aws_key()),
+        )
+        .expect("write planted secret");
+
+        let response = handle_request(
+            request(
+                Some(json!(31)),
+                "tools/call",
+                Some(json!({"name": "scan_secrets", "arguments": {}})),
+            ),
+            &None,
+            &test_context(Some(repo.path())),
+        )
+        .await
+        .expect("tools/call replies");
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let envelope: Value = serde_json::from_str(text).expect("valid json");
+        assert_eq!(envelope["status"], "ready");
+        let findings = envelope["report"]["findings"]
+            .as_array()
+            .expect("findings array");
+        assert!(!findings.is_empty(), "planted key must be found");
+        assert_eq!(findings[0]["path"], "config.py");
+        // The invariant this whole surface exists for: the matched value
+        // never appears in the tool result, only a masked preview.
+        assert!(
+            !text.contains(&planted_aws_key()),
+            "scan_secrets output must never contain the matched value"
+        );
+
+        // The scan also refreshed the on-disk artifact, so a follow-up
+        // get_secret_findings (or resources/read) serves the same findings.
+        let report = findings_artifact::load_artifact(&repo.path())
+            .expect("artifact readable")
+            .expect("artifact written by the scan");
+        assert!(!report.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_secrets_clean_directory_is_ready_with_zero_findings() {
+        let repo = TestRepoDir::new("scan-clean");
+        std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").expect("write clean file");
+
+        let response = handle_request(
+            request(
+                Some(json!(32)),
+                "tools/call",
+                Some(json!({"name": "scan_secrets", "arguments": {}})),
+            ),
+            &None,
+            &test_context(Some(repo.path())),
+        )
+        .await
+        .expect("tools/call replies");
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let envelope: Value = serde_json::from_str(text).expect("valid json");
+        // `ready` with an empty findings array — distinct from
+        // `never_scanned` — is what tells the agent "scanned, clean".
+        assert_eq!(envelope["status"], "ready");
+        assert_eq!(
+            envelope["report"]["findings"]
+                .as_array()
+                .expect("findings array")
+                .len(),
+            0
         );
     }
 
@@ -4332,6 +4755,230 @@ mod unix_integration_tests {
             Some(path.clone()),
             "delete_project",
             json!({"projectId": "project-1"}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(!text.contains(&path), "raw socket path leaked");
+    }
+
+    // ── run_with_project_secrets ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_with_project_secrets_happy_path_injects_and_scrubs_both_secrets() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"my-app"},"secrets":[{"name":"DB_PASSWORD","value":"hunter2","secretId":"secret-1"},{"name":"API_KEY","value":"sk-abcdef","secretId":"secret-2"}]}"#,
+        )
+        .await;
+
+        let response = call_tool(
+            Some(socket),
+            "run_with_project_secrets",
+            json!({
+                "project": "my-app",
+                "command": ["sh", "-c", "printf '%s|%s' \"$DB_PASSWORD\" \"$API_KEY\""],
+            }),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let result: Value = serde_json::from_str(text).expect("valid json");
+        assert_eq!(result["exitCode"], 0);
+        let stdout = result["output"]["stdout"].as_str().expect("stdout");
+        assert!(!stdout.contains("hunter2"), "secret leaked in: {stdout}");
+        assert!(!stdout.contains("sk-abcdef"), "secret leaked in: {stdout}");
+        assert!(
+            !text.contains("hunter2"),
+            "secret leaked in tool text: {text}"
+        );
+        assert!(
+            !text.contains("sk-abcdef"),
+            "secret leaked in tool text: {text}"
+        );
+
+        let injected: Vec<&str> = result["injected"]
+            .as_array()
+            .expect("injected array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(injected, vec!["DB_PASSWORD", "API_KEY"]);
+    }
+
+    #[tokio::test]
+    async fn run_with_project_secrets_uuids_as_keynames_env_names() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"my-app"},"secrets":[{"name":"DB_PASSWORD","value":"hunter2","secretId":"11111111-1111-1111-1111-111111111111"}]}"#,
+        )
+        .await;
+
+        let response = call_tool(
+            Some(socket),
+            "run_with_project_secrets",
+            json!({
+                "project": "my-app",
+                "uuidsAsKeynames": true,
+                "command": ["sh", "-c", "env | grep -o '^_[A-Za-z0-9_]*='"],
+            }),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let result: Value = serde_json::from_str(text).expect("valid json");
+        let stdout = result["output"]["stdout"].as_str().expect("stdout");
+        assert!(
+            stdout.contains("_11111111_1111_1111_1111_111111111111="),
+            "expected uuid-derived env var name in: {stdout}"
+        );
+        assert_eq!(
+            result["injected"],
+            json!(["_11111111_1111_1111_1111_111111111111"])
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_project_secrets_collision_refuses_without_spawning_child() {
+        let socket = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"my-app"},"secrets":[{"name":"db.password","value":"hunter2-collide","secretId":"secret-1"},{"name":"db_password","value":"other-collide-value","secretId":"secret-2"}]}"#,
+        )
+        .await;
+
+        let response = call_tool(
+            Some(socket),
+            "run_with_project_secrets",
+            // A command that would prove the child ran, if it were spawned.
+            json!({"project": "my-app", "command": ["sh", "-c", "echo ran > /dev/null; echo SHOULD_NOT_RUN"]}),
+        )
+        .await;
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("DB_PASSWORD"), "text: {text}");
+        assert!(
+            !text.contains("SHOULD_NOT_RUN"),
+            "child must never be spawned on a naming collision: {text}"
+        );
+        // Never the values, only the colliding env var name.
+        assert!(!text.contains("hunter2-collide"), "value leaked: {text}");
+        assert!(
+            !text.contains("other-collide-value"),
+            "value leaked: {text}"
+        );
+    }
+
+    /// Mirrors `create_secret_value_never_in_output_on_every_status`: no
+    /// secret value from a project release may ever appear in the tool
+    /// result, on any status the mock server replies with — including a
+    /// case where the server's reply carries real values but this tool
+    /// refuses for its own reasons (naming collision) before running
+    /// anything.
+    #[tokio::test]
+    async fn run_with_project_secrets_value_never_in_output_on_every_status() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "denied",
+                r#"{"version":1,"status":"denied","message":"Denied by user"}"#,
+            ),
+            (
+                "locked",
+                r#"{"version":1,"status":"locked","message":"Vault is locked"}"#,
+            ),
+            (
+                "error",
+                r#"{"version":1,"status":"error","message":"boom"}"#,
+            ),
+            (
+                "not-found",
+                r#"{"version":1,"status":"notFound","message":"No matching project found"}"#,
+            ),
+            (
+                "missing-secrets",
+                r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"my-app"}}"#,
+            ),
+            (
+                "empty-secrets",
+                r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"my-app"},"secrets":[]}"#,
+            ),
+            (
+                "collision-refuses-after-fetch",
+                r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"my-app"},"secrets":[{"name":"db.password","value":"hunter2-super-secret","secretId":"secret-1"},{"name":"db_password","value":"hunter2-super-secret-2","secretId":"secret-2"}]}"#,
+            ),
+        ];
+
+        for (label, response_line) in cases {
+            let socket = spawn_mock_server(response_line).await;
+            let response = call_tool(
+                Some(socket),
+                "run_with_project_secrets",
+                json!({"project": "my-app", "command": ["true"]}),
+            )
+            .await;
+
+            assert_eq!(
+                response["result"]["isError"], true,
+                "case {label} should be isError"
+            );
+            let text = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text content");
+            assert!(
+                !text.contains("hunter2-super-secret"),
+                "case {label}: value leaked in tool text: {text}"
+            );
+            assert!(
+                !response.to_string().contains("hunter2-super-secret"),
+                "case {label}: value leaked anywhere in response: {response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_with_project_secrets_requires_non_empty_project_and_command() {
+        let empty_project = call_tool(
+            Some("/nonexistent".to_string()),
+            "run_with_project_secrets",
+            json!({"project": "", "command": ["true"]}),
+        )
+        .await;
+        assert_eq!(empty_project["result"]["isError"], true);
+        let text = empty_project["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("'project'"));
+
+        let empty_command = call_tool(
+            Some("/nonexistent".to_string()),
+            "run_with_project_secrets",
+            json!({"project": "my-app", "command": []}),
+        )
+        .await;
+        assert_eq!(empty_command["result"]["isError"], true);
+        let text = empty_command["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("'command'"));
+    }
+
+    #[tokio::test]
+    async fn run_with_project_secrets_connect_failed_does_not_leak_socket_path() {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+
+        let response = call_tool(
+            Some(path.clone()),
+            "run_with_project_secrets",
+            json!({"project": "my-app", "command": ["true"]}),
         )
         .await;
 

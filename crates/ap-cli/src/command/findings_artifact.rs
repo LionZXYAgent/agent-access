@@ -1,13 +1,16 @@
-//! Read-only mirror of the secret-scan findings artifact schema.
+//! Read-only, forward-tolerant mirror of the secret-scan findings artifact
+//! schema.
 //!
-//! The artifact (`.bitwarden/secret-findings.json`) is produced by `bws
-//! scan` — the Secrets Manager CLI, backed by the `bitwarden-scan` crate in
-//! `sdk-sm` — and owned by that repo. This module is a *reader* only: `aac`
-//! does not scan and does not write this file. Because the schema is owned
-//! elsewhere, deserialization here is deliberately tolerant of fields this
-//! build doesn't recognize (e.g. `severity`/`scan_mode` are read as plain
-//! strings, not closed enums) so a future producer-side addition doesn't
-//! break an older `aac mcp`.
+//! The artifact (`.bitwarden/secret-findings.json`) is owned by the
+//! `bitwarden-scan` crate in `sdk-sm`. It has two producers: `bws scan`
+//! (the Secrets Manager CLI, out of band) and this binary's own MCP
+//! `scan_secrets` tool, which runs the same engine in-process and writes
+//! via the engine's `write_artifact`. This module is the *reader* for
+//! serving: unlike the engine's own closed-enum types, deserialization here
+//! is deliberately tolerant of values this build doesn't recognize (e.g.
+//! `severity`/`scan_mode` are read as plain strings), so an artifact
+//! written by a NEWER external `bws` than the engine rev linked into this
+//! `aac` still serves instead of erroring.
 //!
 //! Invariant carried over from the producer: the artifact never contains a
 //! matched secret value, only a masked [`Finding::preview`].

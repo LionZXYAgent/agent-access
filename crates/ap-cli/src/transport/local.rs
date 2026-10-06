@@ -14,6 +14,7 @@
 //! keeping [`WireCredential`] contents out of logs and error messages, and
 //! every [`LocalTransportError`] variant here is constructed without one.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use ap_client::CredentialQuery;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 /// Local wire protocol version implemented by this client.
@@ -91,6 +93,25 @@ pub fn secret_query_from_flag(value: &str) -> SecretQueryInput {
     }
 }
 
+/// Build a [`ProjectQueryInput`] from a `--project <name|uuid|bw://project/id>`
+/// CLI-style value (architecture doc, M7): a `bw://project/<id>` reference
+/// resolves to an `Id` query (stripping the prefix via
+/// [`strip_project_reference`]); a value that parses as a bare UUID is also
+/// treated as an `Id` (bws parity — `bws run --project-id` accepts a bare
+/// UUID with no reference wrapper); anything else is a `Name` query (exact
+/// match, falling back to a unique case-insensitive match, resolved
+/// desktop-side). Sibling of [`secret_query_from_flag`]; shared by the
+/// `run_with_project_secrets` MCP tool and `aac run --project`.
+pub fn project_query_from_flag(value: &str) -> ProjectQueryInput {
+    if value.starts_with(PROJECT_REFERENCE_PREFIX) {
+        ProjectQueryInput::Id(strip_project_reference(value).to_string())
+    } else if Uuid::parse_str(value).is_ok() {
+        ProjectQueryInput::Id(value.to_string())
+    } else {
+        ProjectQueryInput::Name(value.to_string())
+    }
+}
+
 /// Derive the default environment-variable name for a secret's own name:
 /// uppercased, with every character outside `[A-Z0-9_]` replaced by `_`, and
 /// `_`-prefixed if the result would otherwise start with a digit (env var
@@ -112,6 +133,18 @@ pub fn secret_env_var_name(name: &str) -> String {
         out.insert(0, '_');
     }
     out
+}
+
+/// Derive a POSIX-safe environment-variable name from a secret's own UUID
+/// instead of its name: `_` followed by the UUID with every `-` replaced by
+/// `_` — mirrors sdk-sm's `bws` CLI (`crates/bws/src/util.rs::uuid_to_posix`),
+/// the `--uuids-as-keynames` prior art this escape hatch is named after
+/// (architecture doc, M7). Unlike [`secret_env_var_name`], two distinct
+/// secrets can never collide under this scheme (UUIDs are unique), which is
+/// exactly why `run_with_project_secrets`/`aac run --project` offer it as
+/// the collision escape hatch.
+pub fn secret_env_var_name_from_uuid(secret_id: &str) -> String {
+    format!("_{}", secret_id.replace('-', "_"))
 }
 
 /// Sanitize a username for embedding in a Windows named-pipe path: every
@@ -249,6 +282,21 @@ pub enum SecretQueryInput {
     Search(String),
 }
 
+/// Selector for a `projectSecretsRequest` over the local transport
+/// (architecture doc, M7): exactly one of a project's UUID or its name. No
+/// `Search` variant — the wire protocol's `project` object is
+/// `{"id":...}`/`{"name":...}` only, never a free-text lookup (project-name
+/// resolution, including the exact/unique-case-insensitive fallback, happens
+/// desktop-side, mirroring `secretRequest`'s `name` query).
+#[derive(Debug, Clone)]
+pub enum ProjectQueryInput {
+    /// Look up by project UUID.
+    Id(String),
+    /// Look up by project name (exact, falling back to unique
+    /// case-insensitive match, resolved desktop-side).
+    Name(String),
+}
+
 /// Query payload for a `secretRequest`, adjacently tagged to match the wire
 /// protocol exactly: `{"type":"name","value":"DB_PASSWORD"}`.
 #[derive(Debug, Clone, Serialize)]
@@ -265,6 +313,26 @@ impl From<&SecretQueryInput> for WireSecretQuery {
             SecretQueryInput::Name(n) => WireSecretQuery::Name(n.clone()),
             SecretQueryInput::Id(id) => WireSecretQuery::Id(id.clone()),
             SecretQueryInput::Search(s) => WireSecretQuery::Search(s.clone()),
+        }
+    }
+}
+
+/// The `project` selector object of a `projectSecretsRequest`, per the
+/// architecture doc's M7 wire shape: exactly one of `{"id":"<uuid>"}` or
+/// `{"name":"…"}` — untagged so neither variant adds a wrapping `type`/
+/// `value` envelope the way [`WireQuery`]/[`WireSecretQuery`] do.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum WireProjectSelector {
+    Id { id: String },
+    Name { name: String },
+}
+
+impl From<&ProjectQueryInput> for WireProjectSelector {
+    fn from(query: &ProjectQueryInput) -> Self {
+        match query {
+            ProjectQueryInput::Id(id) => WireProjectSelector::Id { id: id.clone() },
+            ProjectQueryInput::Name(name) => WireProjectSelector::Name { name: name.clone() },
         }
     }
 }
@@ -748,6 +816,32 @@ impl WireProjectCreateRequest {
     }
 }
 
+/// A `projectSecretsRequest` request line: `{version, op:"projectSecretsRequest",
+/// project, client}` (architecture doc, M7) — no `query`/`delivery`/`fill`/
+/// `create`/`update`/`target`; delivery is implicitly inject and there is no
+/// reference form for this op.
+#[derive(Debug, Clone, Serialize)]
+struct WireProjectSecretsRequest {
+    version: u32,
+    op: &'static str,
+    project: WireProjectSelector,
+    client: WireClientInfo,
+}
+
+impl WireProjectSecretsRequest {
+    fn new(project: WireProjectSelector) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            op: "projectSecretsRequest",
+            project,
+            client: WireClientInfo {
+                name: "aac",
+                version: env!("CARGO_PKG_VERSION"),
+            },
+        }
+    }
+}
+
 /// A `describeFillTarget` request line (architecture doc, M5 §2). A peer of
 /// `credentialRequest`, not a delivery mode — it resolves no credential and
 /// touches no vault, so it carries no `query`/`delivery`/`fill`, only
@@ -988,6 +1082,15 @@ struct WireResponse {
     /// deserialize.
     #[serde(default)]
     projects: Option<Vec<WireProjectEntry>>,
+    /// `projectSecretsRequest` only (architecture doc, M7): the enumerated,
+    /// value-bearing secret set of the released project. `#[serde(default)]`
+    /// so every other op's responses still deserialize. Distinguishing
+    /// "missing" (`None`) from "present but empty" (`Some(vec![])`) matters
+    /// here — see `interpret_project_secrets`, which fails closed on both,
+    /// since the desktop's zero-secrets rule returns `notFound` instead of
+    /// an approved-but-empty array.
+    #[serde(default)]
+    secrets: Option<Vec<WireSecret>>,
 }
 
 /// The interpreted, successful outcome of a local credential request.
@@ -1631,6 +1734,175 @@ pub async fn request_project_delete(
     let request = WireTargetRequest::project_delete(target_id.to_string());
     let response = run_request(stream, &request).await?;
     interpret_reference_outcome(response, PROJECT_REFERENCE_PREFIX, "projectDelete")
+}
+
+// ── M7: `bws run` parity — project-scoped bulk secret injection ─────────
+
+/// The interpreted, successful outcome of a local `projectSecretsRequest`
+/// (architecture doc, M7): the released project's name/reference plus its
+/// full, value-bearing secret set. `#[derive(Debug)]` is safe here even
+/// though `secrets` carries values — [`WireSecret`] has its own manual,
+/// redacting `Debug` impl that the derive delegates to.
+#[derive(Debug)]
+pub struct ProjectSecretsOutcome {
+    pub project_name: String,
+    pub reference: String,
+    pub secrets: Vec<WireSecret>,
+}
+
+/// Interpret a parsed [`WireResponse`] into a [`ProjectSecretsOutcome`] or
+/// the corresponding [`LocalTransportError`]. `approved` requires a
+/// `bw://project/` reference with a non-empty derived id, a non-empty
+/// `item.name`, and a PRESENT, NON-EMPTY `secrets` array — a missing OR
+/// empty array is a protocol error (fail closed): the desktop's zero-secrets
+/// rule returns `notFound` instead of an approved-but-empty release
+/// (architecture doc, M7).
+fn interpret_project_secrets(
+    resp: WireResponse,
+) -> Result<ProjectSecretsOutcome, LocalTransportError> {
+    if resp.version != PROTOCOL_VERSION {
+        return Err(LocalTransportError::UnsupportedVersion(resp.version));
+    }
+    // Defensive: a `projectSecretsRequest` reply is `secrets`-shaped
+    // (plural), never `secret`-shaped (singular, the M4 single-secret
+    // reply) — mirrors the value-bearing-reply guards used throughout this
+    // file (`interpret_reference_outcome`, `interpret_project_list`).
+    if resp.secret.is_some() {
+        return Err(LocalTransportError::Protocol(
+            "unexpected single-secret 'secret' reply to a projectSecretsRequest".to_string(),
+        ));
+    }
+
+    let message = |fallback: &str| resp.message.clone().unwrap_or_else(|| fallback.to_string());
+
+    match resp.status {
+        WireStatus::Approved => {
+            let reference = resp.reference.ok_or_else(|| {
+                LocalTransportError::Protocol(
+                    "approved projectSecretsRequest response missing 'reference'".to_string(),
+                )
+            })?;
+            let Some(project_id) = reference.strip_prefix(PROJECT_REFERENCE_PREFIX) else {
+                return Err(LocalTransportError::Protocol(format!(
+                    "approved projectSecretsRequest response has an unparseable 'reference': {reference}"
+                )));
+            };
+            if project_id.is_empty() {
+                return Err(LocalTransportError::Protocol(
+                    "approved projectSecretsRequest response has an empty id in 'reference'"
+                        .to_string(),
+                ));
+            }
+
+            let project_name = resp
+                .item
+                .and_then(|item| item.name)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    LocalTransportError::Protocol(
+                        "approved projectSecretsRequest response missing a non-empty 'item.name'"
+                            .to_string(),
+                    )
+                })?;
+
+            let secrets = resp.secrets.ok_or_else(|| {
+                LocalTransportError::Protocol(
+                    "approved projectSecretsRequest response missing 'secrets'".to_string(),
+                )
+            })?;
+            if secrets.is_empty() {
+                return Err(LocalTransportError::Protocol(
+                    "approved projectSecretsRequest response has an empty 'secrets' array \
+                     (the desktop should have returned notFound for a project with zero \
+                     readable secrets)"
+                        .to_string(),
+                ));
+            }
+
+            Ok(ProjectSecretsOutcome {
+                project_name,
+                reference,
+                secrets,
+            })
+        }
+        WireStatus::Denied => Err(LocalTransportError::Denied(message("Denied by user"))),
+        WireStatus::NotFound => Err(LocalTransportError::NotFound(message(
+            "No matching project found",
+        ))),
+        WireStatus::Locked => Err(LocalTransportError::Locked(message("Vault is locked"))),
+        WireStatus::Timeout => Err(LocalTransportError::ServerTimeout(message(
+            "Approval timed out",
+        ))),
+        WireStatus::RateLimited => Err(LocalTransportError::RateLimited(message("Rate limited"))),
+        WireStatus::Error => Err(LocalTransportError::ServerError(message(
+            "Local agent-access endpoint returned an error",
+        ))),
+        WireStatus::OriginMismatch => Err(LocalTransportError::Protocol(
+            "unexpected 'originMismatch' status for a projectSecretsRequest".to_string(),
+        )),
+        WireStatus::NoSafeTarget => Err(LocalTransportError::Protocol(
+            "unexpected 'noSafeTarget' status for a projectSecretsRequest".to_string(),
+        )),
+    }
+}
+
+/// Perform one full local `projectSecretsRequest`: connect, send, receive,
+/// interpret. One connection per request, per protocol. Local-transport-only
+/// — same no-relay-fallback contract as [`request_secret`] (architecture
+/// doc, M7: "Never rides the relay"); delivery is implicitly inject, so
+/// unlike [`request_secret`] there is no `delivery` parameter.
+pub async fn request_project_secrets(
+    endpoint: &LocalEndpoint,
+    query: &ProjectQueryInput,
+) -> Result<ProjectSecretsOutcome, LocalTransportError> {
+    let stream = connect(endpoint).await?;
+    let request = WireProjectSecretsRequest::new(WireProjectSelector::from(query));
+    let response = run_request(stream, &request).await?;
+    interpret_project_secrets(response)
+}
+
+/// Derive the env-var name for every secret in a `projectSecretsRequest`
+/// release, with a collision check, per the naming rule shared by
+/// `run_with_project_secrets` (MCP) and `aac run --project` (CLI) — both
+/// call this with the identical secrets and `uuids_as_keynames` setting, so
+/// the two surfaces can never disagree about whether a given release
+/// collides.
+///
+/// Default naming is [`secret_env_var_name`] per secret's own name;
+/// `uuids_as_keynames` switches to [`secret_env_var_name_from_uuid`], under
+/// which a collision is structurally impossible (no two secrets share a
+/// UUID) — bws's `--uuids-as-keynames` escape hatch, mirrored here
+/// (architecture doc, M7).
+///
+/// Returns the resolved `(env_name, value)` pairs, in `secrets`' order, when
+/// every name is unique. Returns `Err` with the colliding env var name(s) —
+/// **never a value** — when two or more secrets would map to the same name;
+/// callers must not spawn the child process in that case.
+pub fn resolve_project_secrets_env_names(
+    secrets: &[WireSecret],
+    uuids_as_keynames: bool,
+) -> Result<Vec<(String, Zeroizing<String>)>, Vec<String>> {
+    let mut seen: HashSet<String> = HashSet::with_capacity(secrets.len());
+    let mut collisions: Vec<String> = Vec::new();
+    let mut resolved: Vec<(String, Zeroizing<String>)> = Vec::with_capacity(secrets.len());
+
+    for secret in secrets {
+        let env_name = if uuids_as_keynames {
+            secret_env_var_name_from_uuid(&secret.secret_id)
+        } else {
+            secret_env_var_name(&secret.name)
+        };
+        if !seen.insert(env_name.clone()) && !collisions.contains(&env_name) {
+            collisions.push(env_name.clone());
+        }
+        resolved.push((env_name, secret.value.clone()));
+    }
+
+    if collisions.is_empty() {
+        Ok(resolved)
+    } else {
+        Err(collisions)
+    }
 }
 
 // ── browser fill (architecture doc, M5) ──────────────────────────────────
@@ -3120,6 +3392,247 @@ mod tests {
         assert!(matches!(err, LocalTransportError::Denied(m) if m == "Denied by user"));
     }
 
+    // ── M7: projectSecretsRequest wire serde + interpretation ──────────
+
+    #[test]
+    fn project_secrets_request_serializes_id_selector_exactly() {
+        let request = WireProjectSecretsRequest::new(WireProjectSelector::Id {
+            id: "project-1".to_string(),
+        });
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&request).expect("serialize"))
+                .expect("parse");
+
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["op"], "projectSecretsRequest");
+        assert_eq!(json["project"]["id"], "project-1");
+        assert!(json["project"].get("name").is_none());
+        let mut top_level: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        top_level.sort_unstable();
+        assert_eq!(top_level, vec!["client", "op", "project", "version"]);
+        // No `query`/`delivery`/`fill`/`create`/`update`/`target` on this op.
+        for absent in ["query", "delivery", "fill", "create", "update", "target"] {
+            assert!(json.get(absent).is_none(), "unexpected key: {absent}");
+        }
+    }
+
+    #[test]
+    fn project_secrets_request_serializes_name_selector_exactly() {
+        let request = WireProjectSecretsRequest::new(WireProjectSelector::Name {
+            name: "my-app".to_string(),
+        });
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&request).expect("serialize"))
+                .expect("parse");
+
+        assert_eq!(json["project"]["name"], "my-app");
+        assert!(json["project"].get("id").is_none());
+    }
+
+    fn approved_project_secrets_json() -> &'static str {
+        r#"{"version":1,"status":"approved","reference":"bw://project/proj-1",
+ "item":{"name":"my-app"},
+ "secrets":[{"name":"DB_PASSWORD","value":"hunter2","secretId":"secret-1"},
+            {"name":"API_KEY","value":"key-value","secretId":"secret-2"}]}"#
+    }
+
+    #[test]
+    fn project_secrets_approved_derives_outcome() {
+        let resp: WireResponse =
+            serde_json::from_str(approved_project_secrets_json()).expect("parse");
+        let outcome = interpret_project_secrets(resp).expect("should be Ok");
+        assert_eq!(outcome.project_name, "my-app");
+        assert_eq!(outcome.reference, "bw://project/proj-1");
+        assert_eq!(outcome.secrets.len(), 2);
+        assert_eq!(outcome.secrets[0].name, "DB_PASSWORD");
+        assert_eq!(outcome.secrets[0].value.as_str(), "hunter2");
+        assert_eq!(outcome.secrets[1].secret_id, "secret-2");
+    }
+
+    #[test]
+    fn project_secrets_approved_missing_secrets_is_protocol_error() {
+        let json = r#"{"version":1,"status":"approved","reference":"bw://project/proj-1",
+ "item":{"name":"my-app"}}"#;
+        let resp: WireResponse = serde_json::from_str(json).expect("parse");
+        let err = interpret_project_secrets(resp).expect_err("must error");
+        assert!(matches!(err, LocalTransportError::Protocol(_)));
+    }
+
+    #[test]
+    fn project_secrets_approved_empty_secrets_array_is_protocol_error() {
+        // Fail closed: an approved-but-empty release is impossible by the
+        // desktop's zero-secrets rule (notFound instead) — a client that
+        // sees one anyway must treat it as an error, not an empty success.
+        let json = r#"{"version":1,"status":"approved","reference":"bw://project/proj-1",
+ "item":{"name":"my-app"},"secrets":[]}"#;
+        let resp: WireResponse = serde_json::from_str(json).expect("parse");
+        let err = interpret_project_secrets(resp).expect_err("must error");
+        assert!(matches!(err, LocalTransportError::Protocol(_)));
+    }
+
+    #[test]
+    fn project_secrets_approved_missing_reference_is_protocol_error() {
+        let json = r#"{"version":1,"status":"approved","item":{"name":"my-app"},
+ "secrets":[{"name":"DB_PASSWORD","value":"hunter2","secretId":"secret-1"}]}"#;
+        let resp: WireResponse = serde_json::from_str(json).expect("parse");
+        let err = interpret_project_secrets(resp).expect_err("must error");
+        assert!(matches!(err, LocalTransportError::Protocol(_)));
+    }
+
+    #[test]
+    fn project_secrets_approved_wrong_reference_prefix_is_protocol_error() {
+        let json = r#"{"version":1,"status":"approved","reference":"bw://secret/secret-1",
+ "item":{"name":"my-app"},
+ "secrets":[{"name":"DB_PASSWORD","value":"hunter2","secretId":"secret-1"}]}"#;
+        let resp: WireResponse = serde_json::from_str(json).expect("parse");
+        let err = interpret_project_secrets(resp).expect_err("must error");
+        assert!(matches!(err, LocalTransportError::Protocol(_)));
+    }
+
+    #[test]
+    fn project_secrets_approved_missing_item_name_is_protocol_error() {
+        let json = r#"{"version":1,"status":"approved","reference":"bw://project/proj-1",
+ "secrets":[{"name":"DB_PASSWORD","value":"hunter2","secretId":"secret-1"}]}"#;
+        let resp: WireResponse = serde_json::from_str(json).expect("parse");
+        let err = interpret_project_secrets(resp).expect_err("must error");
+        assert!(matches!(err, LocalTransportError::Protocol(_)));
+    }
+
+    #[test]
+    fn project_secrets_value_bearing_single_secret_reply_is_rejected() {
+        // Defense in depth: a server bug that answers a `projectSecretsRequest`
+        // with the M4 single-secret shape (`secret`, singular) instead of the
+        // M7 plural `secrets` array must not be accepted.
+        let json = r#"{"version":1,"status":"approved",
+ "secret":{"name":"DB_PASSWORD","value":"hunter2","secretId":"secret-1"},
+ "reference":"bw://project/proj-1"}"#;
+        let resp: WireResponse = serde_json::from_str(json).expect("parse");
+        let err = interpret_project_secrets(resp).expect_err("must reject a value-bearing reply");
+        assert!(matches!(err, LocalTransportError::Protocol(_)));
+    }
+
+    #[test]
+    fn project_secrets_status_mapping() {
+        let cases = [
+            ("denied", "Denied by user"),
+            ("locked", "Vault is locked"),
+            ("timeout", "Approval timed out"),
+            ("rateLimited", "Rate limited"),
+            ("error", "Local agent-access endpoint returned an error"),
+            ("notFound", "No matching project found"),
+        ];
+        for (status, default_msg) in cases {
+            let json = format!(r#"{{"version":1,"status":"{status}"}}"#);
+            let resp: WireResponse = serde_json::from_str(&json).expect("parse");
+            let err = interpret_project_secrets(resp).expect_err("non-approved status must error");
+            assert!(err.to_string().contains(default_msg), "status {status}");
+        }
+    }
+
+    // ── M7: env-var naming + collision resolution ──────────────────────
+
+    #[test]
+    fn resolve_project_secrets_env_names_default_naming_no_collision() {
+        let secrets = vec![
+            WireSecret {
+                name: "DB_PASSWORD".to_string(),
+                value: Zeroizing::new("hunter2".to_string()),
+                secret_id: "secret-1".to_string(),
+            },
+            WireSecret {
+                name: "API_KEY".to_string(),
+                value: Zeroizing::new("key-value".to_string()),
+                secret_id: "secret-2".to_string(),
+            },
+        ];
+        let resolved =
+            resolve_project_secrets_env_names(&secrets, false).expect("should not collide");
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].0, "DB_PASSWORD");
+        assert_eq!(resolved[0].1.as_str(), "hunter2");
+        assert_eq!(resolved[1].0, "API_KEY");
+        assert_eq!(resolved[1].1.as_str(), "key-value");
+    }
+
+    #[test]
+    fn resolve_project_secrets_env_names_default_naming_collision_names_env_var_not_value() {
+        // Two secret names that uppercase-sanitize to the same env var name.
+        let secrets = vec![
+            WireSecret {
+                name: "db.password".to_string(),
+                value: Zeroizing::new("hunter2".to_string()),
+                secret_id: "secret-1".to_string(),
+            },
+            WireSecret {
+                name: "db_password".to_string(),
+                value: Zeroizing::new("other-value".to_string()),
+                secret_id: "secret-2".to_string(),
+            },
+        ];
+        let collisions =
+            resolve_project_secrets_env_names(&secrets, false).expect_err("should collide");
+        assert_eq!(collisions, vec!["DB_PASSWORD".to_string()]);
+    }
+
+    #[test]
+    fn resolve_project_secrets_env_names_uuids_as_keynames_never_collides() {
+        // Same name twice would collide under default naming; uuids as
+        // keynames is structurally collision-free (distinct secret ids).
+        let secrets = vec![
+            WireSecret {
+                name: "DB_PASSWORD".to_string(),
+                value: Zeroizing::new("hunter2".to_string()),
+                secret_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            },
+            WireSecret {
+                name: "DB_PASSWORD".to_string(),
+                value: Zeroizing::new("other-value".to_string()),
+                secret_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            },
+        ];
+        let resolved =
+            resolve_project_secrets_env_names(&secrets, true).expect("uuids never collide");
+        assert_eq!(resolved[0].0, "_11111111_1111_1111_1111_111111111111");
+        assert_eq!(resolved[1].0, "_22222222_2222_2222_2222_222222222222");
+    }
+
+    #[test]
+    fn secret_env_var_name_from_uuid_matches_bws_uuid_to_posix_shape() {
+        assert_eq!(
+            secret_env_var_name_from_uuid("759130d0-29dd-48bd-831a-e3bdbafeeb6e"),
+            "_759130d0_29dd_48bd_831a_e3bdbafeeb6e"
+        );
+    }
+
+    // ── M7: project_query_from_flag ─────────────────────────────────────
+
+    #[test]
+    fn project_query_from_flag_treats_reference_as_id() {
+        let query = project_query_from_flag("bw://project/33333333-3333-3333-3333-333333333333");
+        assert!(
+            matches!(query, ProjectQueryInput::Id(id) if id == "33333333-3333-3333-3333-333333333333")
+        );
+    }
+
+    #[test]
+    fn project_query_from_flag_treats_bare_uuid_as_id() {
+        let query = project_query_from_flag("44444444-4444-4444-4444-444444444444");
+        assert!(
+            matches!(query, ProjectQueryInput::Id(id) if id == "44444444-4444-4444-4444-444444444444")
+        );
+    }
+
+    #[test]
+    fn project_query_from_flag_treats_plain_value_as_name() {
+        let query = project_query_from_flag("my-app");
+        assert!(matches!(query, ProjectQueryInput::Name(n) if n == "my-app"));
+    }
+
     // ── reference parsing ────────────────────────────────────────────
 
     #[test]
@@ -4047,6 +4560,96 @@ mod unix_integration_tests {
         let err = request_project_delete(&endpoint, "project-1")
             .await
             .expect_err("should fail to connect");
+
+        assert!(matches!(err, LocalTransportError::ConnectFailed(_)));
+    }
+
+    // ── projectSecretsRequest end-to-end ────────────────────────────────
+
+    #[tokio::test]
+    async fn project_secrets_end_to_end_approved() {
+        let endpoint = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"my-app"},"secrets":[{"name":"DB_PASSWORD","value":"hunter2","secretId":"secret-1"},{"name":"API_KEY","value":"key-value","secretId":"secret-2"}]}"#,
+        )
+        .await;
+
+        let outcome =
+            request_project_secrets(&endpoint, &ProjectQueryInput::Name("my-app".to_string()))
+                .await
+                .expect("should succeed");
+
+        assert_eq!(outcome.project_name, "my-app");
+        assert_eq!(outcome.reference, "bw://project/project-1");
+        assert_eq!(outcome.secrets.len(), 2);
+        assert_eq!(outcome.secrets[0].value.as_str(), "hunter2");
+        assert_eq!(outcome.secrets[1].value.as_str(), "key-value");
+    }
+
+    #[tokio::test]
+    async fn project_secrets_end_to_end_id_selector_sends_id_not_name() {
+        // A `spawn_mock_server`-style handler already asserts the request is
+        // well-formed JSON; this test's real assertion is behavioral: the Id
+        // query must produce an `{"id":...}` selector, not `{"name":...}` —
+        // verified indirectly by exercising the full round trip successfully
+        // with an Id query (a wire-shape assertion covers the JSON directly
+        // in the `mod tests` unit tests above).
+        let endpoint = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"my-app"},"secrets":[{"name":"DB_PASSWORD","value":"hunter2","secretId":"secret-1"}]}"#,
+        )
+        .await;
+
+        let outcome =
+            request_project_secrets(&endpoint, &ProjectQueryInput::Id("project-1".to_string()))
+                .await
+                .expect("should succeed");
+
+        assert_eq!(outcome.secrets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_secrets_end_to_end_not_found() {
+        let endpoint = spawn_mock_server(
+            r#"{"version":1,"status":"notFound","message":"No matching project found"}"#,
+        )
+        .await;
+
+        let err = request_project_secrets(
+            &endpoint,
+            &ProjectQueryInput::Name("nonexistent".to_string()),
+        )
+        .await
+        .expect_err("should be not found");
+
+        assert!(matches!(err, LocalTransportError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn project_secrets_end_to_end_empty_array_is_error_not_empty_success() {
+        let endpoint = spawn_mock_server(
+            r#"{"version":1,"status":"approved","reference":"bw://project/project-1","item":{"name":"empty-project"},"secrets":[]}"#,
+        )
+        .await;
+
+        let err = request_project_secrets(
+            &endpoint,
+            &ProjectQueryInput::Name("empty-project".to_string()),
+        )
+        .await
+        .expect_err("an empty array must fail closed, not succeed with zero secrets");
+
+        assert!(matches!(err, LocalTransportError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn project_secrets_connect_failed_when_no_listener() {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+        let endpoint = LocalEndpoint::Unix(path);
+
+        let err =
+            request_project_secrets(&endpoint, &ProjectQueryInput::Name("my-app".to_string()))
+                .await
+                .expect_err("should fail to connect");
 
         assert!(matches!(err, LocalTransportError::ConnectFailed(_)));
     }

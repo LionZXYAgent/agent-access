@@ -28,8 +28,8 @@ use super::tui::{
 use super::util::{format_connect_notification, format_relative_time};
 use crate::storage::{FileConnectionCache, FileIdentityStorage};
 use crate::transport::local::{
-    self, LocalEndpoint, LocalTransportError, SecretOutcome, SecretQueryInput, WireDelivery,
-    WireOutcome,
+    self, LocalEndpoint, LocalTransportError, ProjectQueryInput, ProjectSecretsOutcome,
+    SecretOutcome, SecretQueryInput, WireDelivery, WireOutcome,
 };
 use ap_client::MemoryConnectionStore;
 
@@ -1043,6 +1043,43 @@ pub(super) async fn fetch_secret_dispatch(
         )),
         Err(e) => Err(color_eyre::eyre::eyre!(e)),
     }
+}
+
+/// Dispatch a `projectSecretsRequest` through the local transport.
+///
+/// Sibling of [`fetch_secret_dispatch`] — same no-relay-fallback contract
+/// (architecture doc, M7: "Never rides the relay"). Unlike
+/// [`fetch_secret_dispatch`], there is no `Delivery` parameter: a project
+/// secrets release is implicitly inject-only, with no reference form
+/// (architecture doc: "there is no reference form — reference-shaped
+/// discovery is find_secrets/list_projects"). Backs `aac run --project`
+/// only; there is deliberately no single-shot print form for this op.
+pub(super) async fn fetch_project_secrets_dispatch(
+    query: &ProjectQueryInput,
+    socket_override: Option<&str>,
+) -> Result<ProjectSecretsOutcome> {
+    let endpoint = match resolve_transport(socket_override) {
+        Transport::Local { endpoint, .. } => endpoint,
+        Transport::Relay => {
+            bail!(
+                "Could not determine the local Bitwarden agent-access endpoint. Secrets Manager \
+                 project secrets are only available through the local Bitwarden desktop app — \
+                 make sure it is installed, running, unlocked, and Agent Access is enabled. \
+                 There is no relay fallback for secrets."
+            );
+        }
+    };
+
+    local::request_project_secrets(&endpoint, query)
+        .await
+        .map_err(|e| match e {
+            LocalTransportError::ConnectFailed(_) => color_eyre::eyre::eyre!(
+                "Could not reach the Bitwarden desktop app locally. Secrets Manager secrets \
+                 require the Bitwarden desktop app to be running, unlocked, and Agent Access \
+                 enabled — there is no relay fallback for secrets."
+            ),
+            other => color_eyre::eyre::eyre!(other),
+        })
 }
 
 /// `aac connect --secret ...` / top-level `aac --secret ...` single-shot

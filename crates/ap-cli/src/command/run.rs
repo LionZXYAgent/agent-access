@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use super::DEFAULT_RELAY_URL;
 use super::connect::{
     CredentialOutcome, Delivery, SecretRequestOutcome, fetch_credential_dispatch,
-    fetch_secret_dispatch,
+    fetch_project_secrets_dispatch, fetch_secret_dispatch,
 };
 use super::output::{exit_code, exit_code_for_report};
 use super::redact::Redactor;
@@ -91,6 +91,26 @@ pub struct RunArgs {
     /// conflicts_with error against an already-present arg).
     #[arg(long)]
     pub secret_env: Option<String>,
+
+    /// Secrets Manager project name, UUID, or `bw://project/<id>` reference
+    /// whose full secret set to inject — `bws run` parity (architecture
+    /// doc, M7). One approval releases every secret in the project; each is
+    /// injected under its own env var name (see --uuids-as-keynames). Local
+    /// transport only — there is no relay fallback. Unlike --secret, a
+    /// project is always required for this mode: there is no whole-org
+    /// form.
+    #[arg(long, conflicts_with_all = ["domain", "id", "search", "reference", "secret", "env_mappings", "env_all"])]
+    pub project: Option<String>,
+
+    /// Name each secret's environment variable after its UUID (a
+    /// POSIX-safe `_`-prefixed form, `-` replaced by `_`) instead of its
+    /// own name — avoids a naming collision when two or more secrets in
+    /// the project would otherwise map to the same environment variable
+    /// name. Only meaningful together with --project; validated at
+    /// runtime rather than via clap's `requires` (same reasoning as
+    /// --secret-env above).
+    #[arg(long)]
+    pub uuids_as_keynames: bool,
 
     /// Token (rendezvous code or PSK token)
     #[arg(long, env = "AAC_TOKEN", conflicts_with = "session")]
@@ -227,12 +247,24 @@ fn collect_secret_values(
 
 impl RunArgs {
     pub async fn run(self) -> Result<()> {
+        if self.secret_env.is_some() && self.project.is_some() {
+            bail!("--secret-env cannot be used with --project");
+        }
+
         if self.secret_env.is_some() && self.secret.is_none() {
             bail!("--secret-env requires --secret");
         }
 
+        if self.uuids_as_keynames && self.project.is_none() {
+            bail!("--uuids-as-keynames requires --project");
+        }
+
         if self.secret.is_some() {
             return run_secret(self).await;
+        }
+
+        if self.project.is_some() {
+            return run_project_secrets(self).await;
         }
 
         // Validate that exactly one of --domain/--id/--search/--ref is provided
@@ -400,6 +432,77 @@ async fn run_secret(args: RunArgs) -> Result<()> {
     } else {
         vec![secret.value.as_str().to_string()]
     };
+
+    let program = args.command[0].clone();
+    let cmd_args = args.command[1..].to_vec();
+
+    let status = run_child(&program, &cmd_args, &env_vars, secret_values, args.no_scrub).await?;
+
+    std::process::exit(status.code().unwrap_or(exit_code::GENERAL_ERROR));
+}
+
+/// `aac run --project ...` — every secret in a Secrets Manager project
+/// injected into the child env in one release (`bws run` parity,
+/// architecture doc M7). Always inject-only, local-transport-only — no
+/// relay fallback (per the architecture doc's M7 wire protocol section).
+/// Env naming and collision handling mirror the `run_with_project_secrets`
+/// MCP tool exactly (both call
+/// `local::resolve_project_secrets_env_names`): a naming collision fails
+/// before the child is ever spawned, naming only the colliding env var
+/// name(s), never a value.
+async fn run_project_secrets(args: RunArgs) -> Result<()> {
+    let project_input = args
+        .project
+        .as_deref()
+        .expect("run_project_secrets is only called when self.project is Some");
+    let query = local::project_query_from_flag(project_input);
+
+    let outcome = match fetch_project_secrets_dispatch(&query, args.socket.as_deref()).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let code = exit_code_for_report(&e);
+            tracing::error!("{e}");
+            std::process::exit(code);
+        }
+    };
+    // Value-free: project name/reference only, never a secret value.
+    tracing::debug!(
+        project = %outcome.project_name,
+        reference = %outcome.reference,
+        secret_count = outcome.secrets.len(),
+        "aac run --project: released project"
+    );
+
+    let env_pairs =
+        match local::resolve_project_secrets_env_names(&outcome.secrets, args.uuids_as_keynames) {
+            Ok(pairs) => pairs,
+            Err(collisions) => {
+                bail!(
+                    "Refusing to run: secrets in project '{}' collide on environment variable \
+                     name(s): {}. Pass --uuids-as-keynames to avoid this, or rename the \
+                     conflicting secrets.",
+                    outcome.project_name,
+                    collisions.join(", ")
+                );
+            }
+        };
+
+    let mut env_vars = HashMap::new();
+    let mut secret_values = Vec::new();
+    for (env_name, value) in &env_pairs {
+        let value = value.as_str().to_string();
+        env_vars.insert(env_name.clone(), value.clone());
+        if !value.is_empty() {
+            secret_values.push(value);
+        }
+    }
+
+    if args.no_scrub {
+        eprintln!(
+            "warning: --no-scrub is set — the child process's stdout/stderr will NOT be \
+             redacted and may leak injected secret values"
+        );
+    }
 
     let program = args.command[0].clone();
     let cmd_args = args.command[1..].to_vec();
@@ -770,5 +873,139 @@ mod tests {
         .expect("should parse");
         assert_eq!(parsed.secret.as_deref(), Some("DB_PASSWORD"));
         assert_eq!(parsed.secret_env.as_deref(), Some("MY_VAR"));
+    }
+
+    // ── --project / --uuids-as-keynames CLI flag mutual exclusion ───────
+
+    #[test]
+    fn project_conflicts_with_domain() {
+        let err = expect_parse_error(&[
+            "run",
+            "--domain",
+            "example.com",
+            "--project",
+            "my-app",
+            "--",
+            "true",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn project_conflicts_with_secret() {
+        let err = expect_parse_error(&[
+            "run",
+            "--secret",
+            "DB_PASSWORD",
+            "--project",
+            "my-app",
+            "--",
+            "true",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn project_conflicts_with_env_all() {
+        let err = expect_parse_error(&["run", "--project", "my-app", "--env-all", "--", "true"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn project_conflicts_with_env_mapping() {
+        let err = expect_parse_error(&[
+            "run",
+            "--project",
+            "my-app",
+            "--env",
+            "FOO=username",
+            "--",
+            "true",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn project_conflicts_with_ref() {
+        let err = expect_parse_error(&[
+            "run",
+            "--ref",
+            "bw://item/item-1",
+            "--project",
+            "my-app",
+            "--",
+            "true",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// `--secret-env` with `--project` can't be caught by clap's
+    /// declarative `conflicts_with` here (see the doc comment on
+    /// `secret_env`) — `RunArgs::run` enforces it itself at runtime instead.
+    #[tokio::test]
+    async fn secret_env_conflicts_with_project_at_runtime() {
+        let parsed = try_parse(&[
+            "run",
+            "--project",
+            "my-app",
+            "--secret-env",
+            "FOO",
+            "--",
+            "true",
+        ])
+        .expect("clap parse itself should succeed");
+
+        let err = parsed
+            .run()
+            .await
+            .expect_err("--secret-env with --project must be rejected at runtime");
+        assert!(format!("{err}").contains("--secret-env cannot be used with --project"));
+    }
+
+    /// `--uuids-as-keynames` without `--project` can't be caught by clap's
+    /// declarative `requires` here (no `--project` conflict of its own to
+    /// trip over, but the same "runtime, not clap" style is kept for
+    /// consistency with `--secret-env`) — `RunArgs::run` enforces it itself.
+    #[tokio::test]
+    async fn uuids_as_keynames_requires_project_at_runtime() {
+        let parsed = try_parse(&[
+            "run",
+            "--domain",
+            "example.com",
+            "--env-all",
+            "--uuids-as-keynames",
+            "--",
+            "true",
+        ])
+        .expect("clap parse itself should succeed");
+
+        let err = parsed
+            .run()
+            .await
+            .expect_err("--uuids-as-keynames without --project must be rejected at runtime");
+        assert!(format!("{err}").contains("--uuids-as-keynames requires --project"));
+    }
+
+    #[test]
+    fn project_alone_parses_ok() {
+        let parsed =
+            try_parse(&["run", "--project", "my-app", "--", "true"]).expect("should parse");
+        assert_eq!(parsed.project.as_deref(), Some("my-app"));
+        assert!(!parsed.uuids_as_keynames);
+    }
+
+    #[test]
+    fn project_with_uuids_as_keynames_parses_ok() {
+        let parsed = try_parse(&[
+            "run",
+            "--project",
+            "my-app",
+            "--uuids-as-keynames",
+            "--",
+            "true",
+        ])
+        .expect("should parse");
+        assert_eq!(parsed.project.as_deref(), Some("my-app"));
+        assert!(parsed.uuids_as_keynames);
     }
 }

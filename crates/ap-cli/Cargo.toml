@@ -26,6 +26,10 @@ ap-relay-protocol = { workspace = true }
 ap-client = { workspace = true, features = ["native-websocket"] }
 async-trait = { workspace = true }
 bitwarden = { workspace = true, optional = true }
+# In-process secret-scanning engine for the MCP `scan_secrets` tool. Not part
+# of the `bws` feature: scanning is core to the MCP surface and must survive
+# `--no-default-features` (the bundled-desktop build).
+bitwarden-scan = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 crossterm = { workspace = true }
