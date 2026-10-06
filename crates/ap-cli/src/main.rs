@@ -28,6 +28,8 @@ fn is_tui_mode(cli: &Cli) -> bool {
         | Some(Commands::Mcp(_))
         | Some(Commands::Fill(_))
         | Some(Commands::DescribeFillTarget(_)) => false,
+        #[cfg(feature = "openshell")]
+        Some(Commands::OpenshellDriver(_)) => false,
         // Default (no subcommand) behaves like `connect`
         None => cli.domain.is_none() && cli.id.is_none() && cli.search.is_none(),
     }

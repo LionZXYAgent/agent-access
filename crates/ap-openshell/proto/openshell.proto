@@ -1,0 +1,149 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Modified by Bitwarden: this is a read-only SUBSET of upstream
+// `proto/openshell.proto` (and of the network-policy messages from upstream
+// `proto/sandbox.proto`, package `openshell.sandbox.v1`), taken from
+// NVIDIA/OpenShell commit 0bca9fb8280045224c910610cba005b7fa5a6a83.
+//
+// Changes from upstream:
+// - Only the five read-only lookups the Bitwarden driver uses are declared on
+//   the `OpenShell` service (ListSandboxes, ListSandboxProviders, GetProvider,
+//   GetProviderProfile, GetSandboxPolicyStatus). No write RPC is declared, so
+//   the generated client cannot issue one.
+// - Messages keep only the fields the driver reads. Field numbers, field types
+//   and the service/package names are unchanged, so the subset is
+//   wire-compatible: protobuf decoders skip the omitted fields.
+// - The network-policy messages are declared in this file's package instead of
+//   `openshell.sandbox.v1`. Message type names are not encoded on the wire.
+// - Authorization method options were removed (they are server-side metadata).
+
+syntax = "proto3";
+
+package openshell.v1;
+
+import "datamodel.proto";
+
+service OpenShell {
+  // List sandboxes.
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+  // List provider records attached to a sandbox.
+  rpc ListSandboxProviders(ListSandboxProvidersRequest)
+      returns (ListSandboxProvidersResponse);
+  // Fetch a provider by name.
+  rpc GetProvider(GetProviderRequest) returns (ProviderResponse);
+  // Fetch one provider type profile by id.
+  rpc GetProviderProfile(GetProviderProfileRequest)
+      returns (ProviderProfileResponse);
+  // Get the load status of a specific policy version.
+  rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest)
+      returns (GetSandboxPolicyStatusResponse);
+}
+
+message ListSandboxesRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
+  int32 page_size = 1;
+  string page_token = 2;
+  string label_selector = 3;
+}
+
+message ListSandboxesResponse {
+  repeated Sandbox sandboxes = 1;
+  string next_page_token = 2;
+}
+
+message Sandbox {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  SandboxSpec spec = 2;
+}
+
+message SandboxSpec {
+  SandboxTemplate template = 6;
+  repeated string providers = 8;
+}
+
+message SandboxTemplate {
+  string image = 1;
+}
+
+message ListSandboxProvidersRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string sandbox = 1;
+  int32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListSandboxProvidersResponse {
+  repeated openshell.datamodel.v1.Provider providers = 1;
+  string next_page_token = 2;
+}
+
+message GetProviderRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string name = 1;
+}
+
+message ProviderResponse {
+  openshell.datamodel.v1.Provider provider = 1;
+}
+
+message GetProviderProfileRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string id = 1;
+}
+
+message ProviderProfileResponse {
+  ProviderProfile profile = 1;
+}
+
+message ProviderProfile {
+  string id = 1;
+  repeated NetworkEndpoint endpoints = 6;
+}
+
+message GetSandboxPolicyStatusRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
+  uint32 version = 2;
+  bool global = 3;
+  string sandbox = 1;
+}
+
+message GetSandboxPolicyStatusResponse {
+  SandboxPolicyRevision revision = 1;
+  uint32 active_version = 2;
+}
+
+message SandboxPolicyRevision {
+  uint32 version = 1;
+  string policy_hash = 2;
+  SandboxPolicy policy = 7;
+}
+
+// Upstream: openshell.sandbox.v1.SandboxPolicy (subset).
+message SandboxPolicy {
+  uint32 version = 1;
+  map<string, NetworkPolicyRule> network_policies = 5;
+}
+
+// Upstream: openshell.sandbox.v1.NetworkPolicyRule (subset).
+message NetworkPolicyRule {
+  string name = 1;
+  repeated NetworkEndpoint endpoints = 2;
+}
+
+// Upstream: openshell.sandbox.v1.NetworkEndpoint (subset).
+message NetworkEndpoint {
+  string host = 1;
+  uint32 port = 2;
+  string protocol = 3;
+  repeated string allowed_ips = 8;
+  repeated uint32 ports = 9;
+  string path = 15;
+  bool advisor_proposed = 18;
+  NetworkCredentialBinding credential_binding = 24;
+}
+
+// Upstream: openshell.sandbox.v1.NetworkCredentialBinding.
+message NetworkCredentialBinding {
+  string provider = 1;
+}

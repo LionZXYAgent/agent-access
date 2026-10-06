@@ -13,17 +13,22 @@ name = "aac"
 path = "src/main.rs"
 
 [features]
-default = ["bws"]
+default = ["bws", "openshell"]
 # Bitwarden Secrets Manager provider. Pulls the full Secrets Manager SDK
 # (reqwest/rustls/rsa/argon2) into the binary; disable it if you only use the
 # `bitwarden` CLI or `example` providers.
 bws = ["dep:bitwarden"]
+# `aac openshell-driver`: Bitwarden as an NVIDIA OpenShell credential driver
+# (spawned by openshell-gateway). On by default so the aac bundled with the
+# desktop app includes it.
+openshell = ["dep:ap-openshell"]
 
 [dependencies]
 ap-noise = { workspace = true }
 ap-relay-client = { workspace = true, features = ["native-websocket"] }
 ap-relay-protocol = { workspace = true }
 ap-client = { workspace = true, features = ["native-websocket"] }
+ap-openshell = { path = "../ap-openshell", optional = true }
 async-trait = { workspace = true }
 bitwarden = { workspace = true, optional = true }
 # In-process secret-scanning engine for the MCP `scan_secrets` tool. Not part

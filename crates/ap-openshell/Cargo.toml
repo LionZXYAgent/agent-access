@@ -1,0 +1,52 @@
+[package]
+name = "ap-openshell"
+description = "Bitwarden credential driver for NVIDIA OpenShell gateways (aac openshell-driver)"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately no dependency on ap-cli or sdk-sm: `cargo test -p ap-openshell`
+# must run without the sdk-sm sibling checkout (architecture §M8.12).
+
+[dependencies]
+clap = { workspace = true }
+prost = "0.14"
+prost-types = "0.14"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "time", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = [
+    "transport",
+    "codegen",
+    "router",
+    "server",
+    "channel",
+    "tls-ring",
+] }
+tonic-prost = "0.14"
+tracing = { workspace = true }
+zeroize = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# getuid for the driver-socket ownership and mode checks.
+libc = "0.2"
+
+[build-dependencies]
+# Pure-Rust protobuf compiler: no system `protoc` needed.
+protox = "0.9"
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+# In-process tonic client over a Unix socket (integration test only).
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

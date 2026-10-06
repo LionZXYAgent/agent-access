@@ -9,6 +9,8 @@ mod fill;
 mod findings_artifact;
 mod listen;
 mod mcp;
+#[cfg(feature = "openshell")]
+mod openshell_driver;
 pub(crate) mod output;
 mod redact;
 mod run;
@@ -30,6 +32,8 @@ pub use connections::ConnectionsArgs;
 pub use fill::{DescribeFillTargetArgs, FillArgs};
 pub use listen::ListenArgs;
 pub use mcp::McpArgs;
+#[cfg(feature = "openshell")]
+pub use openshell_driver::OpenShellDriverArgs;
 pub use run::RunArgs;
 
 const DEFAULT_RELAY_URL: &str = "wss://ap.lesspassword.dev";
@@ -178,6 +182,11 @@ pub enum Commands {
     /// Describe the login form in the active tab of the user's browser: no
     /// vault access, no approval, no value.
     DescribeFillTarget(DescribeFillTargetArgs),
+    /// Serve Bitwarden as an NVIDIA OpenShell credential driver. Spawned by
+    /// `openshell-gateway`; every credential load is approved in the
+    /// Bitwarden desktop app. macOS and Linux only.
+    #[cfg(feature = "openshell")]
+    OpenshellDriver(OpenShellDriverArgs),
 }
 
 /// Process the parsed command and execute the appropriate handler
@@ -190,6 +199,8 @@ pub async fn process_command(cli: Cli, log_rx: Option<LogReceiver>) -> Result<()
         Some(Commands::Mcp(args)) => args.run().await,
         Some(Commands::Fill(args)) => args.run().await,
         Some(Commands::DescribeFillTarget(args)) => args.run().await,
+        #[cfg(feature = "openshell")]
+        Some(Commands::OpenshellDriver(args)) => args.run().await,
         None if cli.domain.is_some()
             || cli.id.is_some()
             || cli.search.is_some()

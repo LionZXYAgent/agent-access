@@ -1,0 +1,17 @@
+The protobuf definitions in this directory are vendored from NVIDIA OpenShell
+(https://github.com/NVIDIA/OpenShell) at commit
+0bca9fb8280045224c910610cba005b7fa5a6a83.
+
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Licensed under the Apache License, Version 2.0 (see LICENSE in this directory).
+
+Files copied unchanged:
+  credential_driver.proto
+  datamodel.proto
+  extension.proto
+  options.proto
+
+Files modified by Bitwarden (each carries a "Modified by Bitwarden" header that
+describes the change):
+  openshell.proto  - read-only subset of upstream openshell.proto and of the
+                     network-policy messages from upstream sandbox.proto

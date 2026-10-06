@@ -9,6 +9,7 @@ members = [
     "crates/ap-relay-client",
     "crates/ap-relay-protocol",
     "crates/ap-cli",
+    "crates/ap-openshell",
     "crates/ap-uniffi",
 ]
 exclude = [
