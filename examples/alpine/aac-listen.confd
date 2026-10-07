@@ -1,0 +1,16 @@
+# /etc/conf.d/aac-listen
+
+# Unprivileged user that owns ~/.access-protocol and the Bitwarden CLI state.
+AAC_USER="aac"
+AAC_HOME="/var/lib/aac"
+
+# Telegram (token file must be readable by AAC_USER only: chmod 600).
+AAC_TELEGRAM_BOT_TOKEN_FILE="/etc/aac/telegram-token"
+AAC_TELEGRAM_OWNER_ID="123456789"
+AAC_TELEGRAM_TIMEOUT="90"
+
+# File containing an unlocked `bw` session key (from `bw unlock --raw`), chmod 600.
+BW_SESSION_FILE="/etc/aac/bw-session"
+
+# Extra arguments for `aac listen`.
+AAC_ARGS="--reusable-psk --connection-name openclaw --token-file /var/lib/aac/psk-token"

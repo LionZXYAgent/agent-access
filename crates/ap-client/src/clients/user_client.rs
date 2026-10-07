@@ -255,6 +255,12 @@ pub enum UserClientRequest {
         query: crate::types::CredentialQuery,
         /// The requesting device's identity fingerprint
         identity: IdentityFingerprint,
+        /// Caller-generated request identifier (echoed in the response).
+        ///
+        /// Useful for showing in approval UIs and correlating audit records.
+        request_id: String,
+        /// Caller's wall-clock time when the request was sent (seconds since Unix epoch).
+        timestamp: u64,
         /// Channel to send the credential reply
         reply: oneshot::Sender<CredentialRequestReply>,
     },
@@ -910,6 +916,8 @@ impl UserClientInner {
             .send(UserClientRequest::CredentialRequest {
                 query: request.query.clone(),
                 identity: source,
+                request_id: request.request_id.clone(),
+                timestamp: request.timestamp,
                 reply: tx,
             })
             .await

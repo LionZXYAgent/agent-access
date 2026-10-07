@@ -1,0 +1,5 @@
+target/
+**/target/
+node_modules/
+examples/js-wasm/pkg/
+.git/

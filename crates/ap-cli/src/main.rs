@@ -6,6 +6,7 @@
 mod command;
 pub(crate) mod providers;
 mod storage;
+pub(crate) mod telegram;
 
 use clap::{CommandFactory, FromArgMatches};
 use color_eyre::eyre::Result;
@@ -18,7 +19,7 @@ use command::{Cli, Commands, process_command};
 /// Returns `true` when the command will launch an interactive TUI session.
 fn is_tui_mode(cli: &Cli) -> bool {
     match &cli.command {
-        Some(Commands::Listen(_)) => true,
+        Some(Commands::Listen(args)) => !args.headless,
         Some(Commands::Connect(args)) => args.domain.is_none() && args.id.is_none(),
         Some(Commands::Connections(_)) | Some(Commands::Run(_)) => false,
         // Default (no subcommand) behaves like `connect`

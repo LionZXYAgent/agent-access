@@ -1,0 +1,36 @@
+#!/sbin/openrc-run
+# OpenRC service for `aac listen --headless --telegram`.
+# Install: cp aac-listen.initd /etc/init.d/aac-listen && cp aac-listen.confd /etc/conf.d/aac-listen
+#          rc-update add aac-listen default && rc-service aac-listen start
+
+name="aac-listen"
+description="Agent Access listener with Telegram approvals"
+
+: ${AAC_USER:=aac}
+: ${AAC_HOME:=/var/lib/aac}
+: ${AAC_LOG:=/var/log/aac-listen.log}
+
+command="/usr/local/bin/aac"
+command_args="listen --headless --telegram ${AAC_ARGS}"
+command_user="${AAC_USER}"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="${AAC_LOG}"
+error_log="${AAC_LOG}"
+directory="${AAC_HOME}"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0700 -o "${AAC_USER}" "${AAC_HOME}"
+    checkpath -f -m 0640 -o "${AAC_USER}" "${AAC_LOG}"
+    export HOME="${AAC_HOME}"
+    export AAC_TELEGRAM_BOT_TOKEN_FILE AAC_TELEGRAM_OWNER_ID AAC_TELEGRAM_TIMEOUT
+    if [ -n "${BW_SESSION_FILE:-}" ] && [ -r "${BW_SESSION_FILE}" ]; then
+        BW_SESSION="$(cat "${BW_SESSION_FILE}")"
+        export BW_SESSION
+    fi
+}

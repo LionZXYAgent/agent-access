@@ -59,7 +59,8 @@ crates/
 │       ├── command/         # connect, listen, connections, run
 │       │   ├── mod.rs       # Cli struct, Commands enum, dispatch
 │       │   ├── connect.rs   # Remote-client connect flow
-│       │   ├── listen.rs    # User-client listen flow
+│       │   ├── listen.rs    # User-client listen flow (TUI; races Telegram when --telegram)
+│       │   ├── headless.rs  # (fork) `aac listen --headless --telegram` daemon loop
 │       │   ├── connections.rs # list/clear cached sessions
 │       │   ├── run.rs       # Fetch credential -> exec command
 │       │   ├── output.rs    # OutputFormat (text/json)
@@ -68,6 +69,11 @@ crates/
 │       │   └── util.rs
 │       ├── providers/
 │       │   └── bitwarden.rs # bw CLI credential lookup
+│       ├── telegram/        # (fork) opt-in Telegram approvals for `aac listen --telegram`
+│       │   ├── api.rs       # minimal Bot API client (long polling, token never logged)
+│       │   ├── approver.rs  # prompts, owner check, single-use callbacks, timeout, /grants /revoke
+│       │   ├── grants.rs    # in-memory standing approvals (device + query + item scope)
+│       │   └── message.rs   # message text (metadata only, never secret values)
 │       └── storage/
 │           ├── session_storage.rs  # File-backed SessionStore
 │           └── identity_storage.rs # File-backed IdentityProvider

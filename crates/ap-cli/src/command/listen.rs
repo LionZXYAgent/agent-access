@@ -27,6 +27,8 @@ use super::tui::{
 use super::util::{format_listen_notification, format_relative_time, val_style};
 use crate::providers::{CredentialProvider, LookupResult, ProviderStatus};
 use crate::storage::{FileConnectionCache, FileIdentityStorage};
+use crate::telegram::message::{DeviceLabel, Outcome};
+use crate::telegram::{CredentialGate, Decision, PendingApproval, TelegramApprover, TelegramArgs};
 
 use super::DEFAULT_RELAY_URL;
 
@@ -34,7 +36,7 @@ use super::DEFAULT_RELAY_URL;
 const IDLE_COMMANDS: &[&str] = &["/pair [name]", "/unlock", "/exit"];
 
 /// How new connections are authenticated.
-enum PairingMode {
+pub(super) enum PairingMode {
     /// Rendezvous code (default) — 9-char alphanumeric code.
     Rendezvous,
     /// Ephemeral PSK — single-use, not persisted.
@@ -85,6 +87,23 @@ impl ApprovalCache {
 
 /// Arguments for the listen command
 #[derive(Args)]
+#[command(after_help = "\
+TELEGRAM APPROVAL:
+  With --telegram, every credential request that needs approval is also sent to your
+  Telegram chat with buttons: Allow once, Allow 15m, Allow 1h, Allow forever, Decline.
+  In the TUI the first answer wins (terminal or Telegram). With --headless there is no
+  TUI and Telegram is the only approver (suitable for systemd/OpenRC/containers).
+
+  Timed grants auto-approve later requests from the same device for the same query and
+  vault item until they expire. They are kept in memory only (cleared on restart) and can
+  be revoked with the bot commands /grants and /revoke <n|all>.
+
+  Required:  AAC_TELEGRAM_BOT_TOKEN (env) or --telegram-bot-token-file
+             --telegram-owner-id (your numeric Telegram user id)
+
+  Example (headless, reusable PSK, Bitwarden CLI unlocked via BW_SESSION):
+    AAC_TELEGRAM_BOT_TOKEN_FILE=/etc/aac/bot-token AAC_TELEGRAM_OWNER_ID=123456789 \\
+      aac listen --headless --telegram --reusable-psk --token-file /var/lib/aac/psk-token")]
 pub struct ListenArgs {
     /// Relay server URL
     #[arg(long, default_value = DEFAULT_RELAY_URL)]
@@ -104,11 +123,33 @@ pub struct ListenArgs {
     /// Credential provider to use
     #[arg(long, default_value = "bitwarden")]
     pub provider: String,
+
+    /// Run without the interactive TUI (for services, containers, no TTY).
+    /// Requires --telegram, which then handles all approvals
+    #[arg(long, env = "AAC_HEADLESS", value_parser = clap::builder::BoolishValueParser::new())]
+    pub headless: bool,
+
+    /// Headless only: name to give a newly paired connection
+    #[arg(long, requires = "headless", value_name = "NAME")]
+    pub connection_name: Option<String>,
+
+    /// Headless only: write the pairing token / rendezvous code to this file (mode 0600)
+    /// instead of printing it to stdout
+    #[arg(long, requires = "headless", value_name = "PATH")]
+    pub token_file: Option<std::path::PathBuf>,
+
+    #[command(flatten)]
+    pub telegram: TelegramArgs,
 }
 
 impl ListenArgs {
     /// Execute the listen command
     pub async fn run(self, log_rx: Option<super::tui_tracing::LogReceiver>) -> Result<()> {
+        if self.headless && !self.telegram.telegram {
+            color_eyre::eyre::bail!(
+                "--headless needs an approver: add --telegram (with a bot token and --telegram-owner-id)"
+            );
+        }
         let mut provider = crate::providers::create_provider(&self.provider)?;
         let pairing_mode = if self.reusable_psk {
             PairingMode::ReusablePsk
@@ -117,7 +158,33 @@ impl ListenArgs {
         } else {
             PairingMode::Rendezvous
         };
-        run_user_client_loop(self.relay_url, pairing_mode, &mut *provider, log_rx).await
+        // Start Telegram before the TUI takes over the terminal so config errors are visible.
+        let telegram = self.telegram.start().await?;
+        match telegram {
+            Some(telegram) if self.headless => {
+                super::headless::run(
+                    super::headless::HeadlessOptions {
+                        relay_url: self.relay_url,
+                        pairing_mode,
+                        connection_name: self.connection_name,
+                        token_file: self.token_file,
+                    },
+                    &mut *provider,
+                    telegram,
+                )
+                .await
+            }
+            telegram => {
+                run_user_client_loop(
+                    self.relay_url,
+                    pairing_mode,
+                    &mut *provider,
+                    log_rx,
+                    telegram,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -140,6 +207,8 @@ enum Phase {
         credential: CredentialData,
         identity: ap_relay_protocol::IdentityFingerprint,
         reply: oneshot::Sender<CredentialRequestReply>,
+        /// Mirror of this prompt in Telegram (when `--telegram` is enabled).
+        telegram: Option<PendingApproval>,
     },
     /// Waiting for the user to enter unlock input (password or session key).
     UnlockInput,
@@ -306,6 +375,7 @@ async fn run_event_loop(
     provider: &mut dyn CredentialProvider,
     log_rx: &mut Option<super::tui_tracing::LogReceiver>,
     approval_cache: &mut ApprovalCache,
+    telegram: Option<&TelegramApprover>,
 ) -> Result<EventLoopExit> {
     let mut phase = Phase::Idle;
 
@@ -424,9 +494,19 @@ async fn run_event_loop(
                                 // Credential approval
                                 (Phase::CredentialApproval { .. }, AppAction::CredentialConfirmed(approval)) => {
                                     let old_phase = std::mem::replace(&mut phase, Phase::Idle);
-                                    if let Phase::CredentialApproval { query, credential, identity, reply } = old_phase {
+                                    if let Phase::CredentialApproval { query, credential, identity, reply, telegram: tg_pending } = old_phase {
                                         let label = credential.domain.clone().unwrap_or_else(|| query.to_string());
                                         let cred_id = credential.credential_id.clone();
+                                        // Answered locally first — update the Telegram mirror in the background.
+                                        if let (Some(tg), Some(pending)) = (telegram, tg_pending) {
+                                            let tg = tg.clone();
+                                            let outcome = if matches!(approval, CredentialApproval::Deny) {
+                                                Outcome::DeclinedLocally
+                                            } else {
+                                                Outcome::AllowedLocally
+                                            };
+                                            tokio::spawn(async move { tg.resolve_externally(&pending.id, outcome).await });
+                                        }
                                         if matches!(approval, CredentialApproval::Deny) {
                                             let _ = reply.send(CredentialRequestReply {
                                                 approved: false,
@@ -550,7 +630,7 @@ async fn run_event_loop(
                                 Span::styled(" reject", Style::default().fg(Color::Yellow)),
                             ]);
                         }
-                        UserClientRequest::CredentialRequest { query, identity, reply } => {
+                        UserClientRequest::CredentialRequest { query, identity, request_id, timestamp, reply } => {
                             // Check auto-approval cache first
                             if approval_cache.is_approved(&identity, &query) {
                                 match provider.lookup(&query) {
@@ -608,11 +688,54 @@ async fn run_event_loop(
                                                 })
                                             })
                                             .unwrap_or_else(|| "unknown device".to_string());
+                                        // Mirror the prompt to Telegram (or auto-approve under a Telegram grant).
+                                        let mut tg_pending = None;
+                                        if let Some(tg) = telegram {
+                                            let device = DeviceLabel {
+                                                name: fresh_connections
+                                                    .iter()
+                                                    .find(|s| s.fingerprint == identity)
+                                                    .and_then(|s| s.name.clone()),
+                                                identity,
+                                            };
+                                            match tg.gate_credential(device, &query, &credential, &request_id, timestamp).await {
+                                                Ok(CredentialGate::AutoApproved(grant)) => {
+                                                    let cred_id = credential.credential_id.clone();
+                                                    let _ = reply.send(CredentialRequestReply {
+                                                        approved: true,
+                                                        credential: Some(credential),
+                                                        credential_id: cred_id,
+                                                    });
+                                                    app.push_msg(MessageKind::Success, format!(
+                                                        "Auto-approved credential for {domain} (Telegram grant, {})",
+                                                        grant.duration.label()
+                                                    ));
+                                                    app.enter_idle(idle_footer(), IDLE_COMMANDS);
+                                                    continue;
+                                                }
+                                                Ok(CredentialGate::Pending(pending)) => {
+                                                    app.push_msg(MessageKind::Info, "Approval request also sent to Telegram — first answer wins");
+                                                    tg_pending = Some(pending);
+                                                }
+                                                Err(e) => {
+                                                    app.push_msg(MessageKind::Warning, format!("Telegram unavailable ({e}) — approve locally"));
+                                                }
+                                            }
+                                        }
+                                        // A still-unanswered earlier prompt is replaced (and thereby denied, as
+                                        // upstream does); make sure its Telegram mirror can't be pressed anymore.
+                                        if let (Phase::CredentialApproval { telegram: Some(old), .. }, Some(tg)) =
+                                            (std::mem::replace(&mut phase, Phase::Idle), telegram)
+                                        {
+                                            let tg = tg.clone();
+                                            tokio::spawn(async move { tg.resolve_externally(&old.id, Outcome::Cancelled).await });
+                                        }
                                         phase = Phase::CredentialApproval {
                                             query,
                                             credential,
                                             identity,
                                             reply,
+                                            telegram: tg_pending,
                                         };
                                         app.set_mode(Mode::CredentialConfirm {
                                             title: format!("Send credential for {domain} to {device_label}?"),
@@ -650,6 +773,42 @@ async fn run_event_loop(
                 }
             }
 
+            // Telegram answered (or timed out) the pending credential prompt
+            decision = async {
+                match &mut phase {
+                    Phase::CredentialApproval { telegram: Some(pending), .. } => (&mut pending.decision).await,
+                    _ => std::future::pending().await,
+                }
+            } => {
+                let old_phase = std::mem::replace(&mut phase, Phase::Idle);
+                if let Phase::CredentialApproval { query, credential, reply, .. } = old_phase {
+                    let label = credential.domain.clone().unwrap_or_else(|| query.to_string());
+                    let cred_id = credential.credential_id.clone();
+                    let decision = decision.unwrap_or(Decision::Decline);
+                    if decision.is_allowed() {
+                        let _ = reply.send(CredentialRequestReply {
+                            approved: true,
+                            credential: Some(credential),
+                            credential_id: cred_id,
+                        });
+                        let how = match decision {
+                            Decision::AllowFor(d) => format!(" (grant for {})", d.label()),
+                            _ => String::new(),
+                        };
+                        app.push_msg(MessageKind::Success, format!("Credential sent for {label} — approved via Telegram{how}"));
+                    } else {
+                        let _ = reply.send(CredentialRequestReply {
+                            approved: false,
+                            credential: None,
+                            credential_id: cred_id,
+                        });
+                        let why = if decision == Decision::TimedOut { "approval timed out" } else { "declined via Telegram" };
+                        app.push_msg(MessageKind::Error, format!("Credential denied for {label} — {why}"));
+                    }
+                }
+                app.enter_idle(idle_footer(), IDLE_COMMANDS);
+            }
+
             // Handle tracing log entries routed into the TUI
             log_entry = async {
                 match log_rx.as_mut() {
@@ -673,6 +832,7 @@ async fn run_user_client_loop(
     pairing_mode: PairingMode,
     provider: &mut dyn CredentialProvider,
     mut log_rx: Option<super::tui_tracing::LogReceiver>,
+    telegram: Option<TelegramApprover>,
 ) -> Result<()> {
     // First iteration: if cached sessions exist, listen on those immediately.
     // On `/pair`, we loop back and start a fresh rendezvous/psk session.
@@ -832,6 +992,7 @@ async fn run_user_client_loop(
             provider,
             &mut log_rx,
             &mut approval_cache,
+            telegram.as_ref(),
         )
         .await?
         {

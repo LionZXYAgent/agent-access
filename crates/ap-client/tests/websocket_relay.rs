@@ -181,12 +181,22 @@ async fn test_e2e_psk_pairing_and_credential_request() {
     // 10. Spawn credential response handler for UserClient
     let credential_handler = tokio::spawn(async move {
         while let Some(request) = request_rx.recv().await {
-            if let UserClientRequest::CredentialRequest { query, reply, .. } = request {
+            if let UserClientRequest::CredentialRequest {
+                query,
+                reply,
+                request_id,
+                timestamp,
+                ..
+            } = request
+            {
                 let domain = match &query {
                     ap_client::CredentialQuery::Domain(d) => d.clone(),
                     _ => panic!("expected Domain query"),
                 };
                 assert_eq!(domain, "example.com", "Domain should match request");
+                // Request metadata is surfaced to the approver.
+                assert!(!request_id.is_empty(), "request_id should be surfaced");
+                assert!(timestamp > 1_600_000_000, "timestamp should be a Unix time");
                 let _ = reply.send(CredentialRequestReply {
                     approved: true,
                     credential: Some(test_credential()),

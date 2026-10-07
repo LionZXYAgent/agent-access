@@ -5,6 +5,7 @@
 
 mod connect;
 mod connections;
+mod headless;
 mod listen;
 pub(crate) mod output;
 mod run;

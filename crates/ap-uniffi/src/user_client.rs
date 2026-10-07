@@ -218,6 +218,7 @@ fn spawn_request_handler(
                     query,
                     identity,
                     reply,
+                    ..
                 } => {
                     let ffi_query = FfiCredentialQuery::from(&query);
                     let remote_fp = identity.to_hex();

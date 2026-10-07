@@ -63,6 +63,8 @@ curl -fsSL "https://raw.githubusercontent.com/bitwarden/agent-access/main/exampl
 ## Examples
 
 * [OpenClaw skill](examples/skills/agent-access/SKILL.md)
+* [OpenClaw skill, inject-only via `aac run`](examples/skills/agent-access-inject/SKILL.md) (fork)
+* [Alpine image + OpenRC service for a headless listener with Telegram approval](examples/alpine/) (fork)
 * [Fetch credential via `aac connect`](examples/shell/get-credential.sh) — parse JSON output with `jq` and pipe to `docker login`
 * [Connect to PostgreSQL via `aac run`](examples/shell/psql-connect.sh) — inject `PGUSER`/`PGPASSWORD` as env vars directly into `psql`
 * [Github Action](examples/github-action/)
@@ -170,6 +172,34 @@ aac run --id <vault-item-id> --env-all -- deploy.sh
 **Available credential fields:** `username`, `password`, `totp`, `uri`, `notes`, `domain`, `credential_id`
 
 When using `--env-all`, each field is injected with an `AAC_` prefix (e.g., `AAC_USERNAME`, `AAC_PASSWORD`). Explicit `--env` mappings override `--env-all` defaults. At least one of `--env` or `--env-all` is required.
+
+## Telegram approval (fork feature)
+
+> This fork ([LionZXYAgent/agent-access](https://github.com/LionZXYAgent/agent-access), branch `feat/telegram-approval`) adds opt-in
+> Telegram approvals to `aac listen`. Upstream Bitwarden Agent Access doesn't include this.
+
+`aac listen --telegram` sends every credential request that needs a decision to your Telegram chat, with **Allow once**,
+**Allow 15m**, **Allow 1h**, **Allow forever** and **Decline** buttons. The credential itself still travels only over the end-to-end
+encrypted Agent Access channel. Telegram only sees metadata (device, query, matched item id, field names, request id).
+
+```shell
+# TUI and Telegram side by side: whichever answers first wins
+aac listen --telegram --telegram-bot-token-file ~/.config/aac-telegram-token --telegram-owner-id 123456789
+
+# Headless (servers, Alpine, containers, systemd/OpenRC): Telegram is the only approver
+BW_SESSION="$(bw unlock --raw)" aac listen --headless --telegram --reusable-psk \
+  --telegram-bot-token-file /etc/aac/telegram-token --telegram-owner-id 123456789 --token-file /var/lib/aac/psk-token
+```
+
+- Only presses from the owner's Telegram user id are accepted. Callbacks are random and single-use. Unanswered prompts are declined
+  after `--telegram-timeout` (default 90 s). Messages are edited to show the outcome.
+- Timed grants auto-approve the same device + query + vault item, silently (logged locally only), until they expire. They're
+  in memory only and revocable with `/grants`, `/revoke <n>` and `/revoke all`.
+- Long polling, so no inbound port is needed. Builds as a static-OpenSSL musl binary for Alpine. See [examples/alpine](examples/alpine/).
+
+Full guide (bot setup, all flags and env vars, grants, OpenClaw, Alpine/OpenRC, security notes): [docs/telegram-approval.md](docs/telegram-approval.md).
+For agents, prefer `aac run`, which injects secrets into the child process, over `--output json`. See the
+[inject-only OpenClaw skill](examples/skills/agent-access-inject/SKILL.md).
 
 ## Contributing
 
