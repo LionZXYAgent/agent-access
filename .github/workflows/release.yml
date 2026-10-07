@@ -39,6 +39,21 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
             name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            name: linux-aarch64
+          # Static musl binaries (Alpine-friendly), built natively in rust:alpine containers.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            name: linux-x86_64-musl
+            musl: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
+            name: linux-aarch64-musl
+            musl: true
           - os: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
@@ -47,6 +62,7 @@ jobs:
             target: x86_64-apple-darwin
             archive: tar.gz
             name: macos-x86_64
+            cross: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
@@ -59,34 +75,71 @@ jobs:
           persist-credentials: false
 
       - name: Install rust
+        if: ${{ !matrix.musl }}
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
         with:
           toolchain: stable
 
       - name: Add target
+        if: ${{ !matrix.musl }}
         run: rustup target add ${{ matrix.target }}
 
       - name: Cache cargo registry
+        if: ${{ !matrix.musl }}
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
           key: ${{ matrix.target }}
 
       - name: Build aac
-        run: cargo build --release --target ${{ matrix.target }} -p ap-cli
+        if: ${{ !matrix.musl }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p ap-cli
         env:
           GIT_HASH: ${{ github.sha }}
+
+      - name: Build aac (static musl, Alpine container)
+        if: ${{ matrix.musl }}
+        env:
+          TARGET: ${{ matrix.target }}
+          GIT_HASH: ${{ github.sha }}
+        run: |
+          docker run --rm -v "$PWD":/src -w /src \
+            -e TARGET -e GIT_HASH -e CARGO_TERM_COLOR -e OPENSSL_STATIC=1 -e CARGO_HOME=/src/.cargo-home \
+            rust:1.93-alpine3.22 sh -euc '
+              apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf perl make
+              cargo build --release --locked --target "$TARGET" -p ap-cli
+              chown -R "'"$(id -u):$(id -g)"'" target'
+
+      - name: Smoke test
+        if: ${{ !matrix.cross }}
+        shell: bash
+        env:
+          BIN: target/${{ matrix.target }}/release/aac
+        run: |
+          if [ "${{ matrix.musl }}" = "true" ]; then
+            run() { docker run --rm -v "$PWD/$BIN":/usr/local/bin/aac:ro alpine:3.22 aac "$@"; }
+          else
+            run() { "$BIN" "$@"; }
+          fi
+          run --version
+          run listen --help | grep -q -- "--telegram-owner-id"
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          tar -czf "aac-${{ matrix.name }}.tar.gz" -C "target/${{ matrix.target }}/release" aac
+          dir="aac-${{ matrix.name }}"
+          mkdir "$dir"
+          cp "target/${{ matrix.target }}/release/aac" LICENSE.txt README.md "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
 
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target\${{ matrix.target }}\release\aac.exe" -DestinationPath "aac-${{ matrix.name }}.zip"
+          $dir = "aac-${{ matrix.name }}"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\aac.exe", LICENSE.txt, README.md -Destination $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -106,6 +159,12 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -113,20 +172,37 @@ jobs:
           merge-multiple: true
           path: artifacts/
 
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ github.event.inputs.version || github.ref_name }}
         run: |
+          ref=$(git rev-parse -q --verify "refs/tags/$VERSION^{commit}" || git rev-parse HEAD)
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "$ref^" 2>/dev/null || true)
+          notes=""
+          if [ "$GH_REPO" != "bitwarden/agent-access" ]; then
+            notes="Unofficial fork of [bitwarden/agent-access](https://github.com/bitwarden/agent-access) that adds opt-in **Telegram approval** to \`aac listen\` (Allow once / 15m / 1h / forever / Decline, owner-only, metadata only, never secret values) and a \`--headless\` mode. See [docs/telegram-approval.md](https://github.com/$GH_REPO/blob/$VERSION/docs/telegram-approval.md). Not affiliated with or supported by Bitwarden.
+
+          Static musl builds (\`*-musl\`) run on Alpine and any Linux. Verify downloads with \`sha256sum -c SHA256SUMS.txt --ignore-missing\`."
+          fi
           gh release create "$VERSION" \
             --title "$VERSION" \
+            --target "$GITHUB_SHA" \
+            --notes "$notes" \
             --generate-notes \
+            ${prev:+--notes-start-tag "$prev"} \
             artifacts/*
 
   publish-crates:
     name: Publish to crates.io
-    if: ${{ inputs.publish_crates == true }}
+    if: ${{ inputs.publish_crates == true && github.repository == 'bitwarden/agent-access' }}
     runs-on: ubuntu-24.04
     needs: build
     environment: crates-io

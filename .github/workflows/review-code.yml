@@ -9,6 +9,8 @@ permissions: {}
 jobs:
   review:
     name: Review
+    # Bitwarden-internal (Azure secrets, bitwarden/gh-actions); skip in forks.
+    if: github.repository == 'bitwarden/agent-access'
     uses: bitwarden/gh-actions/.github/workflows/_review-code.yml@main
     secrets:
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
