@@ -190,7 +190,8 @@ jobs:
           if [ "$GH_REPO" != "bitwarden/agent-access" ]; then
             notes="Unofficial fork of [bitwarden/agent-access](https://github.com/bitwarden/agent-access) that adds opt-in **Telegram approval** to \`aac listen\` (Allow once / 15m / 1h / forever / Decline, owner-only, metadata only, never secret values) and a \`--headless\` mode. See [docs/telegram-approval.md](https://github.com/$GH_REPO/blob/$VERSION/docs/telegram-approval.md). Not affiliated with or supported by Bitwarden.
 
-          Static musl builds (\`*-musl\`) run on Alpine and any Linux. Verify downloads with \`sha256sum -c SHA256SUMS.txt --ignore-missing\`."
+          Static musl builds (\`*-musl\`) run on Alpine and any Linux. Verify downloads with \`sha256sum -c SHA256SUMS.txt --ignore-missing\`.
+          "
           fi
           gh release create "$VERSION" \
             --title "$VERSION" \
